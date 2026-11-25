@@ -24,6 +24,7 @@
 #[cfg(windows)]
 mod crash;
 pub mod prepare;
+#[cfg_attr(not(windows), allow(dead_code))] // used by the Windows loader and its tests
 pub(crate) mod publish;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]

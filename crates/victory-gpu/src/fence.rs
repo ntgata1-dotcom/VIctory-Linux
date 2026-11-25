@@ -183,7 +183,9 @@ static FUNCTIONS: Table<24> = {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use super::*;
+    #[cfg(windows)]
     use crate::object::slot;
 
     #[cfg(windows)]
@@ -228,6 +230,7 @@ mod tests {
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
     }
 
+    #[cfg(windows)] // creates and queries the Windows-only COM object
     #[test]
     fn fence1_interface_is_created_and_queried() {
         const FENCE1_IID: Iid = guid(

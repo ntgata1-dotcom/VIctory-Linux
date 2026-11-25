@@ -5,7 +5,7 @@
 use std::ffi::{c_char, c_void};
 
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, NOT_SUPPORTED, Object, add_ref, missing, put, text,
+    Guid, HRESULT, Interface, Methods, NOT_SUPPORTED, Object, add_ref, missing, text,
 };
 
 /// HDR mode; asked for with this interface id since 2020.
@@ -104,7 +104,7 @@ extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
         unsafe { windows_sys::Win32::Foundation::CloseHandle(request) };
         return hr;
     }
-    put(out, request)
+    super::xgameruntime::put(out, request)
 }
 
 #[cfg(windows)]

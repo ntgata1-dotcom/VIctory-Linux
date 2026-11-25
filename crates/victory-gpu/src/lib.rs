@@ -57,6 +57,7 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
+#[cfg_attr(not(windows), allow(dead_code))] // read by the Windows host; tested everywhere
 mod switch;
 #[cfg(windows)]
 mod tdr;

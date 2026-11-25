@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+#[cfg(windows)]
 mod prebuild;
 mod run;
 mod shader;

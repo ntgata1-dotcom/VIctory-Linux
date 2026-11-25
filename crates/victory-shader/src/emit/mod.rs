@@ -633,6 +633,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
@@ -648,6 +649,7 @@ mod tests {
         }
     }
     use super::container::SigElement;
+    #[cfg(windows)]
     use super::shader::Shader;
     use super::*;
     use crate::native::{ComputeIo, StageIo};
@@ -1218,6 +1220,8 @@ mod tests {
             TRIANGLE | EDGE_FLAGS | CULL,
         ] {
             let ms = triangle_mesh(prim).unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
+            #[cfg(not(windows))]
+            let _ = &ms; // built for the validator, which only Windows has
             #[cfg(windows)]
             if let Some(v) = validator.as_mut() {
                 v.validate(&mut ms.dxil.clone())

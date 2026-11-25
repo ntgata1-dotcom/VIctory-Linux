@@ -26,10 +26,38 @@ static IMAGE_PATHS: Mutex<Vec<(usize, PathBuf)>> = Mutex::new(Vec::new());
 /// own path (`GetModuleFileName`) to find its data, and must not get our
 /// cache copy.
 pub fn set_image_path(base: usize, path: &Path) {
-    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
+    let path = absolute_title_path(path);
     let mut paths = IMAGE_PATHS.lock().unwrap_or_else(|e| e.into_inner());
     paths.retain(|(b, _)| *b != base);
     paths.push((base, path));
+}
+
+/// Makes `path` absolute, as the title stored it: an already-absolute path
+/// is kept as is; a relative path is made absolute against the current
+/// directory. A Windows path is absolute everywhere, regardless of the
+/// host: `C:\title\game.exe` is a title path, not a bare relative one
+/// that the host would make absolute against the wrong root.
+fn absolute_title_path(path: &Path) -> PathBuf {
+    if path.is_absolute() || title_absolute(path) {
+        return path.to_path_buf();
+    }
+    std::path::absolute(path).unwrap_or_else(|_| path.to_owned())
+}
+
+/// Whether `path` looks like an absolute Windows path: a drive root (`C:\`),
+/// a drive-rooted path (`C:\title\game.exe`) or a UNC path (`\\server\share`).
+fn title_absolute(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    let bytes = s.as_bytes();
+    // A drive root: `X:` (nothing else), then a separator.
+    if bytes.len() >= 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes.len() == 2 || bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        return true;
+    }
+    s.starts_with("\\\\")
 }
 
 /// Forgets a title image that was unmapped again.
@@ -51,8 +79,17 @@ pub fn image_named(file: &str) -> Option<usize> {
     let paths = IMAGE_PATHS.lock().unwrap_or_else(|e| e.into_inner());
     paths
         .iter()
-        .find(|(_, p)| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case(file)))
+        .find(|(_, p)| title_file_name(p).is_some_and(|n| n.eq_ignore_ascii_case(file)))
         .map(|(b, _)| *b)
+}
+
+/// The file name of a path, whatever its shape: `C:\title\Mapped.dll` and
+/// `C:\title/Mapped.dll` both name `Mapped.dll`, on whatever host the title
+/// runs on.
+fn title_file_name(path: &Path) -> Option<String> {
+    let s = path.to_string_lossy();
+    let name = s.rsplit(['\\', '/']).next()?;
+    Some(name.to_string())
 }
 
 /// Maps a title DLL the title loads itself (`LoadLibrary`) and returns its

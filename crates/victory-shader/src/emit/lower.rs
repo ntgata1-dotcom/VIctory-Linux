@@ -65,6 +65,7 @@ pub(crate) struct Lowered {
     pub wave_ops: bool,
     /// Whether it declares rasterizer-ordered views.
     #[cfg(test)]
+    #[cfg_attr(not(windows), allow(dead_code))] // read by the GPU tests
     pub rovs: bool,
     /// Whether the module declares `dx.op.waveGetLaneIndex`.
     #[cfg(test)]
