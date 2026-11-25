@@ -346,6 +346,7 @@ impl PlacedFootprint {
     /// The byte ranges (from the footprint's start) that a `size` texel
     /// region at texel `at` covers: one per row of blocks; `None` if the
     /// format has no size or the region leaves the footprint.
+    #[cfg_attr(not(windows), allow(dead_code))] // used by Windows code
     pub(crate) fn rows(&self, at: [u32; 3], size: [u32; 3]) -> Option<Vec<(u64, u64)>> {
         let (element, block) = element(self.format)?;
         let blocks = |texels: u32| u64::from(texels).div_ceil(block);
@@ -1496,6 +1497,7 @@ pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
 
 /// A texture's description as words (the layout of placed views'
 /// resource descriptions); `None` for buffers.
+#[cfg(windows)]
 pub(crate) fn texture_desc(this: This) -> Option<[u32; 14]> {
     let (_, desc) = texture_memory(this)?;
     let mut words = [0u32; 14];
@@ -1576,14 +1578,14 @@ fn now_ms() -> u64 {
 /// this long (and this many presented frames) is given up ([`evict`]).
 /// Two minutes: of the textures given up after 20 s, nine in ten were
 /// read again within a minute (run evict4).
-#[cfg(windows)]
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code and by tests
 pub(crate) const IDLE_MS: u64 = 120_000;
 /// Frames as well as time: in slow runs (seconds a frame) 20 s alone cycled
 /// the textures of a cutscene's alternating shots (run evict2), and 30
 /// frames gave up what the menus and loading made (at 30 fps) before the
 /// world read it (run evict3). At 30 fps the idle time decides; slower, the
 /// card's budget does.
-#[cfg(windows)]
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code and by tests
 pub(crate) const IDLE_FRAMES: u64 = 300;
 /// A use stamp's frame for "never" (tests).
 #[cfg(windows)]
@@ -1709,6 +1711,7 @@ fn candidates() -> Vec<Owned> {
 /// up at (`frame`, `now`): every one idle for [`IDLE_FRAMES`] and
 /// [`IDLE_MS`], then the least recently used others until `over` bytes are
 /// gone (indices).
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code
 fn choose(uses: &[(u64, u64, u64)], frame: u64, now: u64, over: u64) -> Vec<usize> {
     let idle = |&(f, ms, _): &(u64, u64, u64)| frame.saturating_sub(f) >= IDLE_FRAMES && now.saturating_sub(ms) >= IDLE_MS;
     let (mut gone, mut rest): (Vec<usize>, Vec<usize>) = (0..uses.len()).partition(|&i| idle(&uses[i]));

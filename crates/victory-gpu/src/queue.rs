@@ -113,6 +113,8 @@ extern "system" fn release(this: This) -> u32 {
 /// Queues the lists' host lists behind what the queue holds, and runs what
 /// may run (`crate::hold`; decision 0007).
 extern "system" fn execute(this: This, count: u32, lists: *const This) {
+    #[cfg(not(windows))]
+    let _ = this;
     if lists.is_null() {
         return;
     }
@@ -140,6 +142,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
 /// What ran held work: the title's submission, a queue's Signal or Wait, a
 /// CPU fence call, PresentX, or our timer.
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code
 pub(crate) enum Why {
     Submission,
     Signal,
@@ -475,6 +478,7 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }

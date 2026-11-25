@@ -193,6 +193,7 @@ pub(crate) fn presented() {
 
 /// Diagnostics: logs [`WAITS`] since the last call.
 #[cfg(feature = "diagnostics")]
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code
 pub(crate) fn log() {
     let [waits, at_once, shared] = [0, 1, 2].map(|i| WAITS[i].swap(0, Ordering::Relaxed));
     tracing::info!("frame waits: {waits}, {at_once} of them ended at once; presents sharing a flip tick: {shared}");

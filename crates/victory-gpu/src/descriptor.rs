@@ -547,6 +547,7 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
 
 /// For each record (tag, index, generation): whether it names a view that
 /// is current, as [`view_at`] would find it (one lock for them all).
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code
 fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     records
@@ -834,6 +835,7 @@ static FUNCTIONS: Table<24> = {
 };
 
 #[cfg(test)]
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code
 pub(crate) mod tests {
     /// Work to run while `make_read` makes the textures of a read slot (the
     /// slot), outside the heaps' lock.

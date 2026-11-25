@@ -32,6 +32,7 @@ pub mod dxgi;
 pub mod external;
 pub mod fence;
 pub mod frame;
+#[cfg_attr(not(windows), allow(dead_code))] // read by the Windows host; tested everywhere
 mod hold;
 #[cfg(windows)]
 mod host;

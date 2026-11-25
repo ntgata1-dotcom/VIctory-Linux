@@ -72,6 +72,7 @@ pub(crate) extern "system" fn add_ref(this: This) -> u32 {
 }
 
 /// An object's reference count.
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code
 pub(crate) fn refs(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     unsafe { &*this }.refs.load(Ordering::Acquire)

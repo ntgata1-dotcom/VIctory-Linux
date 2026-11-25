@@ -139,21 +139,25 @@ pub(crate) fn set(this: This, value: u64) -> HRESULT {
 static WAITED: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 
 /// Events set since the last call and how long they waited, summed.
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code
 pub(crate) fn take_waited() -> (u64, std::time::Duration) {
     let n = WAITED.0.swap(0, Ordering::Relaxed);
     (n, std::time::Duration::from_micros(WAITED.1.swap(0, Ordering::Relaxed)))
 }
 
 /// A fence's value.
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code
 pub(crate) fn value(this: This) -> u64 {
     fence(this).value.load(Ordering::Acquire)
 }
 
 /// Keeps a fence alive while a queue holds a Signal of it, until
 /// [`let_go`].
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code
 pub(crate) fn keep(this: This) {
     object::add_ref(this);
 }
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code
 pub(crate) fn let_go(this: This) {
     release(this);
 }

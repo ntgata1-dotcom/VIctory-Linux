@@ -173,14 +173,17 @@ pub(crate) fn segments(this: This) -> Vec<std::sync::Arc<crate::host::HostList>>
 
 /// Waits recorded after commands: the title list goes on in a new host
 /// list, which runs once the wait holds.
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code
 static CUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Lists reset or released while a queue still held some of their host
 /// lists: D3D12 lets a list be reset as soon as it is submitted (Grand
 /// Theft Auto VI does, 0-21 times a world frame).
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code
 static EARLY_RESETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Cuts and early resets since the last call (the frame line).
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code
 pub(crate) fn take_cuts() -> (u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     (CUTS.swap(0, Relaxed), EARLY_RESETS.swap(0, Relaxed))
@@ -807,10 +810,12 @@ extern "system" fn copy_texture_region(
 /// Texture read backs since the last frame-rate line: how many, bytes
 /// (diagnostics).
 #[cfg(feature = "diagnostics")]
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code
 pub(crate) static READ_BACKS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// (texture, buffer) pairs read back so far, each logged once (diagnostics).
 #[cfg(feature = "diagnostics")]
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code
 static READ_BACK_PAIRS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
 
 /// Texture to buffer (a read back): the region is copied on the host into
