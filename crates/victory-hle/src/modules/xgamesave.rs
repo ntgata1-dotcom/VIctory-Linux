@@ -1112,6 +1112,12 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_kept_blob_past_the_link_limit_is_copied() {
+        if crate::modules::xmem::on_wine() {
+            eprintln!(
+                "Wine's CreateHardLinkW maps to link(2) on the host filesystem, whose link limit is not NTFS's 1023. Skipping."
+            );
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let links = tempfile::tempdir().unwrap();
         let root = dir.path();
