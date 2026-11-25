@@ -32,12 +32,14 @@ pub fn set_image_path(base: usize, path: &Path) {
     paths.push((base, path));
 }
 
-/// Makes `path` absolute, as the title stored it: an already-absolute path
-/// is kept as is; a relative path is made absolute against the current
-/// directory. A Windows path is absolute everywhere, regardless of the
-/// host: `C:\title\game.exe` is a title path, not a bare relative one
-/// that the host would make absolute against the wrong root.
+/// Makes `path` absolute. On Windows, as `std::path::absolute` does
+/// (`GetFullPathNameW`: `/` becomes `\`, `..` is resolved), so the title
+/// gets the path Windows would give it. Elsewhere a Windows path is
+/// absolute too: `C:\title\game.exe` is a title path, not a relative one
+/// that the host would make absolute against its own root, so it and an
+/// already-absolute path are kept as stored.
 fn absolute_title_path(path: &Path) -> PathBuf {
+    #[cfg(not(windows))]
     if path.is_absolute() || title_absolute(path) {
         return path.to_path_buf();
     }
@@ -46,6 +48,7 @@ fn absolute_title_path(path: &Path) -> PathBuf {
 
 /// Whether `path` looks like an absolute Windows path: a drive root (`C:\`),
 /// a drive-rooted path (`C:\title\game.exe`) or a UNC path (`\\server\share`).
+#[cfg(not(windows))]
 fn title_absolute(path: &Path) -> bool {
     let s = path.to_string_lossy();
     let bytes = s.as_bytes();
@@ -287,6 +290,34 @@ pub fn use_console_timers() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// On Windows a title path is what `GetFullPathNameW` makes of it, as
+    /// before: separators normalized and `..` resolved.
+    #[cfg(windows)]
+    #[test]
+    fn windows_title_paths_are_normalized() {
+        let path = absolute_title_path(Path::new(r"C:/games/x/../game.exe"));
+        assert_eq!(path, PathBuf::from(r"C:\games\game.exe"));
+    }
+
+    /// Elsewhere a Windows-style absolute title path is kept as stored, not
+    /// joined to the host's current directory; a relative one is made
+    /// absolute.
+    #[cfg(not(windows))]
+    #[test]
+    fn windows_style_title_paths_stay_absolute_on_other_hosts() {
+        for stored in [
+            r"C:\title\game.exe",
+            r"C:/title/game.exe",
+            r"C:",
+            r"\\server\share\game.exe",
+        ] {
+            assert!(title_absolute(Path::new(stored)), "{stored}");
+            assert_eq!(absolute_title_path(Path::new(stored)), PathBuf::from(stored));
+        }
+        assert!(!title_absolute(Path::new("game.exe")));
+        assert!(absolute_title_path(Path::new("game.exe")).is_absolute());
+    }
 
     #[test]
     fn a_quoted_angle_bracket_does_not_end_its_tag() {
