@@ -17,7 +17,7 @@
 //! RDNA2 hardware published by others. Probes whose result no public source
 //! fixes (`model: None`) only check that the two adapters agree.
 
-use super::host::{Dispatch, Host, Root, Stride, View};
+use super::host::{Dispatch, Host, Root, Stride, View, under_wine};
 use super::valu_tests::ONE_AT_A_TIME;
 use super::{HostShader, lower, validator};
 use crate::native::{
@@ -2989,13 +2989,20 @@ fn f16_results_round_as_the_mode_says() {
     })]));
 }
 
-/// The check `victory-gpu` runs at device creation: the RX 6700 XT fuses
-/// the lowering's multiply-add, WARP does not.
+/// The check `victory-gpu` runs at device creation: Microsoft's WARP does
+/// not fuse the lowering's DXIL `FMad`, the RX 6700 XT does, and vkd3d's WARP
+/// does too. Under Wine, report what the host actually does instead of
+/// asserting the Microsoft rasterizer's answer.
 #[test]
 fn hosts_that_do_not_fuse_are_named() {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     if let Ok(warp) = Host::new(true) {
-        assert_eq!(warp.fuses_fmad(), Ok(false), "WARP");
+        if under_wine() {
+            let fuses = warp.fuses_fmad().expect("the check runs");
+            eprintln!("WARP adapter under Wine fuses FMad: {fuses}");
+        } else {
+            assert_eq!(warp.fuses_fmad(), Ok(false), "WARP");
+        }
     }
     if let Ok(hardware) = Host::new(false) {
         let fuses = hardware.fuses_fmad().expect("the check runs");

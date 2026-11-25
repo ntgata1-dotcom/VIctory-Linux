@@ -14,6 +14,20 @@ use super::HostShader;
 use super::container::SigElement;
 use crate::dxbc::{Container, FourCC};
 
+/// Whether the D3D12 host is Wine. Its WARP adapter is vkd3d-proton's, not
+/// Microsoft's rasterizer, and it fuses DXIL `FMad` where Windows WARP does
+/// not. Tests that compare host behaviour use this to keep both answers.
+#[cfg(test)]
+pub fn under_wine() -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    // SAFETY: both names are NUL terminated, and the module is checked
+    // before looking up its export. The export is never called.
+    unsafe {
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+        !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+    }
+}
+
 pub struct Host {
     pub device: ID3D12Device,
     warp: bool,
