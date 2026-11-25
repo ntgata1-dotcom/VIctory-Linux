@@ -82,6 +82,29 @@ fn append_to_log(text: &str) {
     let _ = append_record(file, text);
 }
 
+/// `WriteFile` only promises atomicity for a single sector, and a record
+/// spans many: another reporter can write between our bytes even with
+/// `FILE_APPEND_DATA`. Keep each record whole with a process-local lock.
+/// Never wait on it for long: an exception handler may belong to the thread
+/// that held it.
+static APPENDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn append_guard() -> Option<std::sync::MutexGuard<'static, ()>> {
+    use std::sync::TryLockError;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(10);
+    loop {
+        match APPENDING.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(TryLockError::Poisoned(e)) => return Some(e.into_inner()),
+            Err(TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::yield_now();
+            }
+            Err(TryLockError::WouldBlock) => return None,
+        }
+    }
+}
+
 fn append_record(file: &std::path::Path, text: &str) -> std::io::Result<()> {
     use std::io::{Error, ErrorKind, Write};
 
@@ -89,9 +112,12 @@ fn append_record(file: &std::path::Path, text: &str) -> std::io::Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let record = format!("unix time {now}, process {}\n{text}\n", std::process::id());
+    let _guard = append_guard();
     let mut file = std::fs::OpenOptions::new().create(true).append(true).open(file)?;
     // Formatting directly into the file can append fragments separately.
-    // Use one append, with no lock to acquire from an exception handler.
+    // Use one append per record; the guard keeps other reporters out of it.
+    // A handler that cannot take the guard still writes: a rare interleaving
+    // in a crash log is better than losing the report.
     if file.write(record.as_bytes())? == record.len() {
         Ok(())
     } else {
