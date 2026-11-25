@@ -86,9 +86,17 @@ pub fn image_named(file: &str) -> Option<usize> {
         .map(|(b, _)| *b)
 }
 
-/// The file name of a path, whatever its shape: `C:\title\Mapped.dll` and
-/// `C:\title/Mapped.dll` both name `Mapped.dll`, on whatever host the title
-/// runs on.
+/// The file name of a title path, as `Path::file_name` finds it: Windows
+/// splits at both `\` and `/`.
+#[cfg(windows)]
+fn title_file_name(path: &Path) -> Option<&std::ffi::OsStr> {
+    path.file_name()
+}
+
+/// The file name of a title path, whatever its separators:
+/// `C:\title\Mapped.dll` and `C:\title/Mapped.dll` both name `Mapped.dll`.
+/// Off Windows, `Path::file_name` splits only at `/`.
+#[cfg(not(windows))]
 fn title_file_name(path: &Path) -> Option<String> {
     let s = path.to_string_lossy();
     let name = s.rsplit(['\\', '/']).next()?;
@@ -317,6 +325,20 @@ mod tests {
         }
         assert!(!title_absolute(Path::new("game.exe")));
         assert!(absolute_title_path(Path::new("game.exe")).is_absolute());
+    }
+
+    /// A title image is found by its file name whichever separator its path
+    /// uses, on every host.
+    #[test]
+    fn title_file_names_end_at_either_separator() {
+        for stored in [
+            r"C:\title\Mapped.dll",
+            r"C:\title/Mapped.dll",
+            "/title/Mapped.dll",
+        ] {
+            let name = title_file_name(Path::new(stored));
+            assert!(name.is_some_and(|n| n == "Mapped.dll"), "{stored}");
+        }
     }
 
     #[test]
