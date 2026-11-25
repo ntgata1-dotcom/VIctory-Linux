@@ -43,14 +43,10 @@ use host::Host;
 #[cfg(not(windows))]
 use validator_stub::Validator;
 
-/// A host that cannot check anything, for hosts where the host pipeline
-/// check does not exist (any host without a D3D12 host device). Every
-/// method reports the same error, so all callers treat the checks as
-/// skipped.
+/// A host without a D3D12 device: `new` fails, so the host pipeline
+/// checks are skipped.
 #[cfg(not(windows))]
 mod host {
-    use victory_shader::emit::HostShader;
-
     /// A so-called host; see the module note.
     pub struct Host;
 
@@ -58,28 +54,6 @@ mod host {
         pub fn new(_warp: bool) -> Result<Self, String> {
             Err("host pipeline checks are available on Windows only".into())
         }
-
-        pub fn pipeline(&self, _vs: &HostShader, _ps: &HostShader) -> Result<(), String> {
-            Err("host pipeline checks are available on Windows only".into())
-        }
-
-        pub fn mesh_pipeline(&self, _vs: &HostShader, _ps: &HostShader) -> Result<(), String> {
-            Err("host pipeline checks are available on Windows only".into())
-        }
-
-        pub fn compute_pipeline(&self, _cs: &HostShader) -> Result<(), String> {
-            Err("host pipeline checks are available on Windows only".into())
-        }
-    }
-
-    /// A shader that needs the Windows host to build; never called.
-    pub fn stub_ps() -> HostShader {
-        unreachable!("host checks are available on Windows only")
-    }
-
-    /// A pipeline check on the Windows host; never called.
-    pub fn stub_vs(_ps: &HostShader) -> Result<HostShader, String> {
-        unreachable!("host checks are available on Windows only")
     }
 }
 use victory_shader::structure::{self, Atom, LaneExit};
@@ -222,6 +196,7 @@ struct Checks {
     /// kept to build those pipelines after the walk.
     keep: Option<Kept>,
     validator: Option<Validator>,
+    #[cfg(windows)]
     host: Option<(Host, emit::HostShader)>,
 }
 
@@ -297,6 +272,7 @@ pub fn run(
                                 validator: validate
                                     .then(|| Validator::load(dll.as_deref()).ok())
                                     .flatten(),
+                                #[cfg(windows)]
                                 host: pipelines
                                     .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
                                     .flatten(),
@@ -707,6 +683,7 @@ fn check(
             &shader.dxil,
         );
     }
+    #[cfg(windows)]
     if let Some((h, stub_ps)) = &checks.host {
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
@@ -724,8 +701,12 @@ fn check(
             Err(e) => t.fail(format!("pipeline: {e}"), &label),
         }
     }
+    #[cfg(windows)]
+    let checked = checks.host.is_some();
+    #[cfg(not(windows))]
+    let checked = false;
     let Some(v) = checks.validator.as_mut() else {
-        if t.list && checks.host.is_none() {
+        if t.list && !checked {
             t.lines.push(format!("{}  emitted", label()));
         }
         return;

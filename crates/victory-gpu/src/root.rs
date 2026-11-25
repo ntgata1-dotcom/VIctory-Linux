@@ -220,7 +220,6 @@ static FUNCTIONS: Table<24> = {
 // The shims they test are Windows-only.
 #[cfg(all(test, windows))]
 mod tests {
-    #[cfg(windows)]
     use super::*;
     use crate::object::{E_NOINTERFACE, E_POINTER, S_FALSE, S_OK, slot};
 

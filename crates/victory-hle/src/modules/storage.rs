@@ -212,16 +212,13 @@ mod tests {
         assert!(drive.ends_with(":\\"), "{drive}");
         // Title file calls on it reach the folder.
         let path = format!("{drive}save.dat\0");
-        #[cfg(windows)]
-        {
-            let mut attributes = [0u8; 36];
-            let get_attributes = super::super::files::GetFileAttributesExW;
-            let wide: Vec<u16> = path.encode_utf16().collect();
-            assert_ne!(
-                get_attributes(wide.as_ptr(), 0, attributes.as_mut_ptr().cast()),
-                0
-            );
-        }
+        let mut attributes = [0u8; 36];
+        let get_attributes = super::super::files::GetFileAttributesExW;
+        let wide: Vec<u16> = path.encode_utf16().collect();
+        assert_ne!(
+            get_attributes(wide.as_ptr(), 0, attributes.as_mut_ptr().cast()),
+            0
+        );
 
         let mut info = SpaceInfo {
             available_free: 0,
