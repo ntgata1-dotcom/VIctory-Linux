@@ -321,7 +321,10 @@ mod tests {
             r"\\server\share\game.exe",
         ] {
             assert!(title_absolute(Path::new(stored)), "{stored}");
-            assert_eq!(absolute_title_path(Path::new(stored)), PathBuf::from(stored));
+            assert_eq!(
+                absolute_title_path(Path::new(stored)),
+                PathBuf::from(stored)
+            );
         }
         assert!(!title_absolute(Path::new("game.exe")));
         assert!(absolute_title_path(Path::new("game.exe")).is_absolute());
