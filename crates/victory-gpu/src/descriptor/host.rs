@@ -2220,10 +2220,32 @@ mod tests {
             return; // no host GPU
         };
         // Every index a translated shader can reach exists (clamped below
-        // `HEAP_VIEWS`, `HEAP_SAMPLERS`).
-        // SAFETY: plain queries of live heaps.
+        // `HEAP_VIEWS`, `HEAP_SAMPLERS`) where the host takes a view heap
+        // that large; a host that caps its view heaps below (NVIDIA, and
+        // vkd3d-proton on its 32 MiB Vulkan descriptor heaps) gets the
+        // title's slots and `MIN_DYNAMIC` more, as `HostHeap::new` says.
+        // SAFETY: plain queries of live heaps, a plain heap creation.
         unsafe {
-            assert!(heap.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_VIEWS);
+            let takes_all = host()
+                .unwrap()
+                .device
+                .CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: victory_shader::emit::HEAP_VIEWS,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .is_ok();
+            let views = heap.heap.GetDesc().NumDescriptors;
+            if takes_all {
+                assert!(views >= victory_shader::emit::HEAP_VIEWS);
+            } else {
+                assert_eq!(
+                    (views, heap.dynamic),
+                    (4 + MIN_DYNAMIC, MIN_DYNAMIC),
+                    "a capped heap"
+                );
+            }
             let samplers = HostHeap::new(true, 128).unwrap();
             assert!(samplers.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_SAMPLERS);
         }
