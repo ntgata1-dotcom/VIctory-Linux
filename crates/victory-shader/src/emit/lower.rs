@@ -12169,6 +12169,7 @@ mod tests {
             let st = structure::structure(&p).unwrap();
             let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
             let io = io::raise(&p, &native).unwrap();
+            #[cfg_attr(not(windows), allow(unused_mut))] // the validator, Windows-only, writes it
             let mut lowered = lower(&Parts {
                 native: &native,
                 p: &p,

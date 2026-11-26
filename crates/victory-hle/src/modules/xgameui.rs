@@ -431,6 +431,7 @@ mod tests {
             .push((title.to_owned(), password));
     }
 
+    #[cfg(windows)] // read by the Windows-only test below
     fn asked_password(title: &str) -> Option<bool> {
         ASKED
             .lock()
@@ -441,6 +442,7 @@ mod tests {
             .map(|(_, p)| *p)
     }
 
+    #[cfg(windows)] // the Windows dialog's edit control
     #[test]
     fn password_scope_masks_the_edit_control() {
         use windows_sys::Win32::UI::WindowsAndMessaging as wm;
