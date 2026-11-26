@@ -15,7 +15,7 @@ for log in "$@"; do
                 if ($i == "ms/frame") ms = $(i - 1)
                 if ($i ~ /^draws\/frame/) d = $(i - 1)
                 if ($i == "preparing:") p = substr($(i - 1), 2)
-                if ($i == "copies") c = $(i + 1)
+                if ($i == "copies" && c == "") c = $(i + 1)
                 if ($i == "GPU;") g = $(i - 3)
                 if ($i == "copying" && $(i + 1) == "back") b = $(i - 1)
             }
