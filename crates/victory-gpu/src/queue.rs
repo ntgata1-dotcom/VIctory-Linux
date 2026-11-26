@@ -855,8 +855,18 @@ extern "system" fn copy_page_mappings(
     if batches.is_null() && count > 0 {
         return E_INVALIDARG;
     }
+    // Counted only: with the worker (`VICTORY_ASYNC_QUEUE`) `HELD` is held
+    // through whole submissions, and the title's thread would wait for one
+    // to count this, so it is counted only when free.
     #[cfg(windows)]
-    if held().holds_work(this as usize) {
+    if async_queue() {
+        if let Ok(held) = HELD.try_lock()
+            && held.holds_work(this as usize)
+        {
+            drop(held);
+            account().mappings += 1;
+        }
+    } else if held().holds_work(this as usize) {
         account().mappings += 1;
     }
     #[cfg(not(windows))]
