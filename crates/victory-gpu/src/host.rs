@@ -2458,10 +2458,11 @@ impl Batch {
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         self.pending.clear();
         let mut total = 0;
-        for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
+        let refreshes = std::mem::take(&mut self.refreshes);
+        // Each refresh brings one host copy up to date: many at once go to
+        // our refresh threads as well as this one (`refresh_all`).
+        let done = refresh_all(&refreshes);
+        for ((shadow, from, to), (copied, us)) in refreshes.into_iter().zip(done) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::range(from, to - from, us, 0);
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
@@ -2479,6 +2480,161 @@ impl Batch {
         }
         total
     }
+}
+
+/// A batch's refreshes of this many or more go to [`refresh_pool`]'s threads
+/// as well as the caller's (`VICTORY_REFRESH_THREADS`, with the caller's:
+/// half the logical processors, 2 to 8; 1 refreshes on the caller alone).
+/// A world frame refreshes about 17,700 host copies, mostly small, one after
+/// another: with the queue worker that work is the frame's wall.
+const SPREAD_FROM: usize = 16;
+
+/// Brings each host copy of `refreshes` up to date ([`crate::shadow::Shadow::update`]):
+/// the bytes copied and the microseconds taken, by refresh. They are
+/// distinct copies (a batch keeps one refresh per copy); what they share,
+/// the guards and the trackers' marks, is locked, as the title's faults
+/// reach it on any thread meanwhile.
+fn refresh_all(refreshes: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)]) -> Vec<(usize, u64)> {
+    let one = |i: usize| {
+        let (shadow, from, to) = &refreshes[i];
+        let started = std::time::Instant::now();
+        let copied = shadow.update(*from, to - from);
+        (copied, started.elapsed().as_micros() as u64)
+    };
+    match refresh_pool() {
+        Some(pool) if refreshes.len() >= SPREAD_FROM => pool.run(refreshes.len(), &one),
+        _ => (0..refreshes.len()).map(one).collect(),
+    }
+}
+
+/// Threads of ours that take refreshes of a batch by index.
+struct RefreshPool {
+    /// The batch being refreshed, if any (one at a time: submissions are).
+    job: Mutex<Option<RefreshJob>>,
+    ready: std::sync::Condvar,
+}
+
+/// One batch: what to call per index, the next index to take, how many are
+/// left to finish, and their results.
+struct RefreshJob {
+    /// The caller's closure, borrowed: [`RefreshPool::run`] returns only
+    /// once no thread can call it any more.
+    each: *const (dyn Fn(usize) -> (usize, u64) + Sync),
+    count: usize,
+    next: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    left: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    results: std::sync::Arc<Vec<(std::sync::atomic::AtomicUsize, std::sync::atomic::AtomicU64)>>,
+    done: std::sync::Arc<(Mutex<()>, std::sync::Condvar)>,
+}
+
+// SAFETY: `each` points at a `Sync` closure the caller of `run` keeps alive
+// until every thread is done with it.
+unsafe impl Send for RefreshJob {}
+
+impl RefreshJob {
+    /// Takes and runs indices until none are left.
+    fn help(&self) {
+        loop {
+            let i = self.next.fetch_add(1, Ordering::Relaxed);
+            if i >= self.count {
+                return;
+            }
+            // SAFETY: see `each`.
+            let (copied, us) = unsafe { (*self.each)(i) };
+            self.results[i].0.store(copied, Ordering::Relaxed);
+            self.results[i].1.store(us, Ordering::Relaxed);
+            if self.left.fetch_sub(1, Ordering::AcqRel) == 1 {
+                let _held = self.done.0.lock().unwrap_or_else(|e| e.into_inner());
+                self.done.1.notify_all();
+            }
+        }
+    }
+
+    fn share(&self) -> RefreshJob {
+        RefreshJob {
+            each: self.each,
+            count: self.count,
+            next: self.next.clone(),
+            left: self.left.clone(),
+            results: self.results.clone(),
+            done: self.done.clone(),
+        }
+    }
+}
+
+impl RefreshPool {
+    fn run(&self, count: usize, each: &(dyn Fn(usize) -> (usize, u64) + Sync)) -> Vec<(usize, u64)> {
+        // SAFETY: only the lifetime is erased; this function waits below
+        // until every index has run, and the job is taken out of the slot
+        // before it returns, so no thread calls `each` afterwards.
+        let each: *const (dyn Fn(usize) -> (usize, u64) + Sync) =
+            unsafe { std::mem::transmute(each as *const (dyn Fn(usize) -> (usize, u64) + Sync + '_)) };
+        let job = RefreshJob {
+            each,
+            count,
+            next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            left: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(count)),
+            results: std::sync::Arc::new(
+                (0..count)
+                    .map(|_| (std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicU64::new(0)))
+                    .collect(),
+            ),
+            done: std::sync::Arc::new((Mutex::new(()), std::sync::Condvar::new())),
+        };
+        let mine = job.share();
+        *self.job.lock().unwrap_or_else(|e| e.into_inner()) = Some(job);
+        self.ready.notify_all();
+        mine.help();
+        {
+            let mut held = mine.done.0.lock().unwrap_or_else(|e| e.into_inner());
+            while mine.left.load(Ordering::Acquire) > 0 {
+                held = mine.done.1.wait(held).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+        // Out of the slot before `each` goes: threads that look later find
+        // nothing, and those holding a share find no index left.
+        *self.job.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mine.results.iter().map(|(c, us)| (c.load(Ordering::Relaxed), us.load(Ordering::Relaxed))).collect()
+    }
+
+    fn work(&self) {
+        loop {
+            let job = {
+                let mut slot = self.job.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    if let Some(job) = slot.as_ref()
+                        && job.next.load(Ordering::Relaxed) < job.count
+                    {
+                        break job.share();
+                    }
+                    slot = self.ready.wait(slot).unwrap_or_else(|e| e.into_inner());
+                }
+            };
+            job.help();
+        }
+    }
+}
+
+/// The refresh threads, started on first use; none with one thread.
+fn refresh_pool() -> Option<&'static RefreshPool> {
+    static POOL: OnceLock<Option<RefreshPool>> = OnceLock::new();
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    let threads = || {
+        std::env::var("VICTORY_REFRESH_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or_else(|| {
+            std::thread::available_parallelism().map_or(4, |n| n.get() / 2).clamp(2, 8)
+        })
+    };
+    let pool = POOL
+        .get_or_init(|| (threads() > 1).then(|| RefreshPool { job: Mutex::new(None), ready: std::sync::Condvar::new() }))
+        .as_ref()?;
+    STARTED.call_once(|| {
+        let n = threads();
+        for i in 1..n {
+            let _ = std::thread::Builder::new().name(format!("victory refresh {i}")).spawn(move || pool.work());
+        }
+        tracing::info!(threads = n, "refreshes of host copies go to several threads (VICTORY_REFRESH_THREADS)");
+    });
+    Some(pool)
 }
 
 /// Copies title memory at submission. The ranges were checked against their
@@ -2596,6 +2752,32 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
         let next = ((at / step + 1) * step).min(end);
         f(at, next - at);
         at = next;
+    }
+}
+
+#[cfg(test)]
+mod refresh_threads {
+    /// A batch spread over the refresh threads runs every index once, its
+    /// results by index, and batch after batch reuses the threads.
+    #[test]
+    fn every_index_runs_once_and_results_keep_their_order() {
+        let Some(pool) = super::refresh_pool() else {
+            return; // one thread here: nothing is spread
+        };
+        for round in 0..50 {
+            let count = 1 + round * 37;
+            let runs: Vec<std::sync::atomic::AtomicU32> = (0..count).map(|_| std::sync::atomic::AtomicU32::new(0)).collect();
+            let each = |i: usize| {
+                runs[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                (i * 3, i as u64 + round as u64)
+            };
+            let results = pool.run(count, &each);
+            assert_eq!(results.len(), count);
+            for (i, &(copied, us)) in results.iter().enumerate() {
+                assert_eq!((copied, us), (i * 3, i as u64 + round as u64));
+                assert_eq!(runs[i].load(std::sync::atomic::Ordering::Relaxed), 1, "index {i} of round {round}");
+            }
+        }
     }
 }
 
