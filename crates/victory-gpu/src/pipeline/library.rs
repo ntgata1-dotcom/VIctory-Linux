@@ -633,10 +633,11 @@ mod tests {
             return; // no host GPU here
         };
         let shader = |i: usize| {
-            let source = format!(
-                "#define RS \"UAV(u0)\"\nRWByteAddressBuffer b : register(u0);\n\
-                 [RootSignature(RS)] [numthreads(1, 1, 1)] void main() {{ b.Store(0, b.Load(4) * {i} + {i}); }}"
-            );
+            // Nothing runs: the group size alone makes each program another.
+            // No resources and no root signature in the source, which Wine's
+            // compiler would refuse (raw and structured buffer access) or
+            // drop.
+            let source = format!("[numthreads({}, 1, 1)] void main() {{}}", i + 1);
             let mut blob = None;
             // SAFETY: the source outlives the call; the blob is read within it.
             unsafe {
@@ -667,9 +668,23 @@ mod tests {
         let Some(codes) = (0..2 * N).map(shader).collect::<Option<Vec<_>>>() else {
             return; // no shader compiler here
         };
-        // SAFETY: the code holds its root signature.
-        let root: ID3D12RootSignature =
-            unsafe { device.CreateRootSignature(0, &codes[0]) }.unwrap();
+        // SAFETY: an empty description; the blob is read while it lives.
+        let root: ID3D12RootSignature = unsafe {
+            let mut blob = None;
+            D3D12SerializeRootSignature(
+                &D3D12_ROOT_SIGNATURE_DESC::default(),
+                D3D_ROOT_SIGNATURE_VERSION_1,
+                &mut blob,
+                None,
+            )
+            .unwrap();
+            let blob = blob.unwrap();
+            let bytes = std::slice::from_raw_parts(
+                blob.GetBufferPointer().cast::<u8>(),
+                blob.GetBufferSize(),
+            );
+            device.CreateRootSignature(0, bytes).unwrap()
+        };
         struct Shared(ID3D12Device1, ID3D12RootSignature, ID3D12PipelineLibrary1);
         // SAFETY: D3D12 objects are free-threaded.
         unsafe impl Sync for Shared {}
