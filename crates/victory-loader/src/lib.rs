@@ -23,6 +23,8 @@
 
 #[cfg(windows)]
 mod crash;
+#[cfg(windows)]
+mod hooks;
 pub mod prepare;
 #[cfg_attr(not(windows), allow(dead_code))] // used by the Windows loader and its tests
 pub(crate) mod publish;
