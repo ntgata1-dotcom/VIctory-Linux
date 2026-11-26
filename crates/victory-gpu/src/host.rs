@@ -2398,28 +2398,28 @@ impl HostList {
     }
 }
 
-/// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
-/// gives a range to shaders, and before the lists run.
-///
-/// Also the textures brought up to date in the submission so far: most
-/// lists of a world submission sample the same textures, and a texture in
-/// physical-page memory is hashed whole each time it is checked. Checked
-/// once, it is checked again only after a step that writes title memory.
+/// A submission's refreshes not done yet, merged per buffer copy into
+/// disjoint ranges: what a range overlaps, or lies within a page of,
+/// coalesces, and distant ranges of one copy are copied apart instead of
+/// copying the span between them. Done before a step that writes title
+/// memory or gives a range to shaders, and before the lists run.
 ///
 /// A copy's range brought up to date is not copied again in the submission
-/// until a step writes title memory: every list of a world submission using
-/// title memory asks for every copy whole. What the title's threads write
+/// until a step writes title memory. What the title's threads write
 /// meanwhile is for later submissions (on the console it would race the
 /// GPU).
+///
+/// A copy's disjoint ranges: the copy held, so that its address names no
+/// other.
+type Ranges = std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>;
+
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
-    /// Where each copy's refresh is in `refreshes`, by copy.
-    pending: std::collections::HashMap<usize, usize>,
-    /// The range of each copy brought up to date since the last title
-    /// write, by copy (held, so that its address names no other).
-    current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// The disjoint ranges each copy is to be brought up to date in.
+    pending: Ranges,
+    /// The ranges of each copy brought up to date since the last title
+    /// write.
+    current: Ranges,
 }
 
 impl Batch {
@@ -2429,20 +2429,20 @@ impl Batch {
         if shadow.clean() {
             return;
         }
-        let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
-        if self.current.get(&key).is_some_and(|&(_, a, b)| a <= address && end <= b) {
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        let end = address + len;
+        if self
+            .current
+            .get(&key)
+            .is_some_and(|(_, ranges)| covered(ranges, address, end))
+        {
             return;
         }
-        match self.pending.get(&key) {
-            Some(&i) => {
-                let (_, from, to) = &mut self.refreshes[i];
-                (*from, *to) = ((*from).min(address), (*to).max(end));
-            }
-            None => {
-                self.pending.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
-            }
-        }
+        let (_, ranges) = self
+            .pending
+            .entry(key)
+            .or_insert_with(|| (shadow.clone(), vec![]));
+        push_range(ranges, COALESCE, address, end);
     }
 
     /// Before a step that writes title memory: pending refreshes are done
@@ -2456,29 +2456,84 @@ impl Batch {
     fn flush(&mut self) -> usize {
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
-        self.pending.clear();
         let mut total = 0;
-        for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
-            total += copied;
-            // Kept: the union with what was current if they touch, else
-            // the larger.
-            let key = std::sync::Arc::as_ptr(&shadow) as usize;
-            let (_, a, b) = self.current.entry(key).or_insert((shadow, from, to));
-            if from <= *b && *a <= to {
-                (*a, *b) = ((*a).min(from), (*b).max(to));
-            } else if to - from > *b - *a {
-                (*a, *b) = (from, to);
+        for (key, (shadow, ranges)) in self.pending.drain() {
+            for (from, to) in ranges {
+                let started = std::time::Instant::now();
+                let copied = shadow.update(from, to - from);
+                let us = started.elapsed().as_micros() as u64;
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::range(from, to - from, us, 0);
+                PREPARING[0].fetch_add(us, Ordering::Relaxed);
+                PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+                total += copied;
+                let (_, current) = self
+                    .current
+                    .entry(key)
+                    .or_insert_with(|| (shadow.clone(), vec![]));
+                push_copied(current, from, to);
             }
         }
         total
     }
+}
+
+/// Refreshes whose gap is at most a page: coalesced, one kernel copy is
+/// cheaper than two.
+const COALESCE: usize = crate::watch::PAGE;
+
+/// Adds `[address, end)` to `ranges`, kept disjoint: what the range
+/// overlaps, or lies within `gap` of, merges into it — and ranges it now
+/// bridges merge together. The ranges to copy take [`COALESCE`] (one
+/// kernel copy is cheaper than two across a page's gap); the ranges
+/// copied take no gap, so coverage never claims a byte no flush copied
+/// (a request inside a gap would be wrongly skipped).
+fn push_range(ranges: &mut Vec<(usize, usize)>, gap: usize, address: usize, end: usize) {
+    let (mut from, mut to) = (address, end);
+    let mut i = 0;
+    while i < ranges.len() {
+        let (a, e) = ranges[i];
+        if a <= to.saturating_add(gap) && from <= e.saturating_add(gap) {
+            ranges.remove(i);
+            from = from.min(a);
+            to = to.max(e);
+        } else {
+            i += 1;
+        }
+    }
+    ranges.push((from, to));
+    ranges.sort_unstable();
+}
+
+/// Whether `[address, end)` lies inside one of `ranges`.
+fn covered(ranges: &[(usize, usize)], address: usize, end: usize) -> bool {
+    ranges.iter().any(|&(a, e)| a <= address && end <= e)
+}
+
+/// Adds the range a flush copied to `ranges`, the ranges already copied:
+/// joined only where they overlap by a whole page, or meet across a page
+/// boundary. A flush guards only pages its range covers whole, so a
+/// union of ranges meeting or overlapping inside a page could claim a
+/// page none of them guarded, and a later request for it would be
+/// skipped — the split page of #2473. Joined with the rule of #2474:
+/// the ranges join when their intersection contains a whole page.
+fn push_copied(ranges: &mut Vec<(usize, usize)>, from: usize, to: usize) {
+    let (mut f, mut t) = (from, to);
+    let mut i = 0;
+    while i < ranges.len() {
+        let (a, e) = ranges[i];
+        let (lo, hi) = (a.max(f), e.min(t));
+        let joins = lo.div_ceil(crate::watch::PAGE) <= hi / crate::watch::PAGE;
+        if joins {
+            ranges.remove(i);
+            f = f.min(a);
+            t = t.max(e);
+        } else {
+            i += 1;
+        }
+    }
+    ranges.push((f, t));
+    ranges.sort_unstable();
 }
 
 /// Copies title memory at submission. The ranges were checked against their
@@ -3941,7 +3996,152 @@ fn pump() {
 
 #[cfg(test)]
 mod batch {   // `mod tests` is already taken at the top of this file
-    use super::Batch;
+    use super::*;
+
+    /// Ranges of one copy stay disjoint: what a range overlaps, or lies
+    /// within a page of, coalesces; distant ranges do not copy the span
+    /// between them.
+    #[test]
+    fn ranges_of_a_copy_stay_disjoint() {
+        let mut rs = vec![];
+        push_range(&mut rs, COALESCE, 0x1_0000, 0x1_1000);
+        push_range(&mut rs, COALESCE, 0x40_0000, 0x40_1000);
+        assert_eq!(rs, [(0x1_0000, 0x1_1000), (0x40_0000, 0x40_1000)]);
+        assert!(covered(&rs, 0x1_0000, 0x1_1000));
+        assert!(!covered(&rs, 0x1_0000, 0x2_0000));
+        // A page's gap coalesces ...
+        push_range(&mut rs, COALESCE, 0x1_1000 + crate::watch::PAGE, 0x1_2000 + crate::watch::PAGE);
+        assert_eq!(
+            rs,
+            [
+                (0x1_0000, 0x1_2000 + crate::watch::PAGE),
+                (0x40_0000, 0x40_1000),
+            ]
+        );
+        // ... a page and one byte more stays apart.
+        push_range(
+            &mut rs,
+            COALESCE,
+            0x1_2000 + 2 * crate::watch::PAGE + 1,
+            0x1_2900 + 2 * crate::watch::PAGE + 1,
+        );
+        assert_eq!(rs.len(), 3);
+        // A range bridging all of them coalesces them into one.
+        push_range(&mut rs, COALESCE, 0x1_3000 + crate::watch::PAGE, 0x50_0000);
+        assert_eq!(rs, [(0x1_0000, 0x50_0000)]);
+        assert!(covered(&rs, 0x2_0000, 0x4f_0000));
+    }
+
+    /// The ranges a flush copied join only where they meet across a page
+    /// boundary, and a request is covered only inside one range: a page's
+    /// gap coalesces what to copy, never what has been copied (a missed
+    /// refresh found on hardware: pages 0, 2 and 1 flushed in that order
+    /// copied pages 0 and 2 and skipped 1).
+    #[test]
+    fn the_gap_between_copied_ranges_is_not_covered() {
+        let mut copied = vec![(0x1_0000, 0x1_1000)];
+        push_copied(&mut copied, 0x2_1000, 0x2_2000);
+        // A page apart: not joined, the gap between them stays pending.
+        assert_eq!(copied, [(0x1_0000, 0x1_1000), (0x2_1000, 0x2_2000)]);
+        assert!(!covered(&copied, 0x1_1000, 0x2_1000));
+        // Meeting inside a page: not joined either — a flush guards only
+        // pages its range covers whole, so ranges meeting there together
+        // must not claim the page none of them guarded.
+        push_copied(&mut copied, 0x1_1000, 0x2_1000);
+        assert_eq!(copied, [(0x1_0000, 0x1_1000), (0x1_1000, 0x2_1000), (0x2_1000, 0x2_2000)]);
+        assert!(!covered(&copied, 0x1_1000 - 4, 0x1_1000 + 4));
+        // Overlapping without a whole page between them: not joined either,
+        // a union of page-flanking ranges would claim a page left unguarded.
+        let mut flanks = vec![(0x1_0000, 0x1_8000)];
+        push_copied(&mut flanks, 0x1_4000, 0x3_0000);
+        assert_eq!(flanks, [(0x1_0000, 0x1_8000), (0x1_4000, 0x3_0000)]);
+        assert!(!covered(&flanks, 0x1_0000, 0x2_0000));
+        // Meeting at a page boundary, or overlapping by a whole page: joined.
+        let mut whole = vec![(0x1_0000, 0x2_0000)];
+        push_copied(&mut whole, 0x2_0000, 0x3_0000);
+        assert_eq!(whole, [(0x1_0000, 0x3_0000)]);
+        assert!(covered(&whole, 0x1_1000, 0x2_1000));
+        let mut spans = vec![(0x1_0000, 0x3_0000)];
+        push_copied(&mut spans, 0x2_4000, 0x4_0000);
+        assert_eq!(spans, [(0x1_0000, 0x4_0000)]);
+        assert!(covered(&spans, 0x2_4000, 0x3_0000));
+    }
+
+    /// A submission asking for distant parts of one copy refreshes them
+    /// apart, not the span between them.
+    #[test]
+    fn distant_refreshes_of_a_copy_are_copied_apart() {
+        use crate::watch::PAGE;
+        let p = crate::watch::tests::pool(8);
+        let len = 8 * PAGE;
+        crate::shadow::register(p, p as u64, len as u64);
+        let Some(copy) = crate::shadow::find(p as u64, len as u64) else {
+            crate::shadow::unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let mut batch = Batch::default();
+        batch.add(&copy, p, PAGE / 2);
+        batch.add(&copy, p + 6 * PAGE, PAGE / 2);
+        let ranges = &batch.pending.values().next().unwrap().1;
+        assert_eq!(ranges, &[(p, p + PAGE / 2), (p + 6 * PAGE, p + 6 * PAGE + PAGE / 2)]);
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    /// Two flushes that each copy part of one page do not make the page
+    /// current: the page is guarded only by a flush covering it whole, so
+    /// what the halves copied must not join, and a later whole-page
+    /// request in the same submission still refreshes (the split page
+    /// of #2473).
+    #[test]
+    fn a_page_copied_in_two_halves_is_refreshed_whole() {
+        use crate::watch::PAGE;
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        crate::shadow::register(p, p as u64, len as u64);
+        let Some(copy) = crate::shadow::find(p as u64, len as u64) else {
+            crate::shadow::unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let mut batch = Batch::default();
+        batch.add(&copy, p, PAGE / 2);
+        assert_eq!(batch.flush(), PAGE / 2, "the first half is copied");
+        batch.add(&copy, p + PAGE / 2, PAGE / 2);
+        assert_eq!(batch.flush(), PAGE / 2, "the other half is copied");
+        // Neither flush guarded the page, so the two halves must not join
+        // into a current range covering it: the page is still refreshed.
+        batch.add(&copy, p, PAGE);
+        assert_eq!(batch.flush(), PAGE, "the whole page is refreshed");
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    /// The pages between two flushed ranges of one copy are refreshed
+    /// when asked for (pages 0, 2 and 1, in that order).
+    #[test]
+    fn a_page_between_flushed_ranges_is_refreshed_when_asked_for() {
+        use crate::watch::PAGE;
+        let p = crate::watch::tests::pool(4);
+        let len = 4 * PAGE;
+        crate::shadow::register(p, p as u64, len as u64);
+        let Some(copy) = crate::shadow::find(p as u64, len as u64) else {
+            crate::shadow::unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let mut batch = Batch::default();
+        batch.add(&copy, p, PAGE);
+        assert_eq!(batch.flush(), PAGE, "page 0");
+        batch.add(&copy, p + 2 * PAGE, PAGE);
+        assert_eq!(batch.flush(), PAGE, "page 2");
+        // The middle page has not been copied: asking for it refreshes it.
+        batch.add(&copy, p + PAGE, PAGE);
+        assert_eq!(batch.flush(), PAGE, "page 1");
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
 
     /// A host copy of tracked title memory: a submission whose lists all ask
     /// for it whole copies the one page the title wrote, once, and again
