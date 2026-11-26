@@ -1,5 +1,7 @@
 //! Command queues. Submitted lists run on the host GPU and are waited for,
-//! so fence signals complete at once.
+//! so fence signals complete at once; with `VICTORY_ASYNC_QUEUE=1` they run
+//! on a worker thread of ours instead, and the title's calls return at once
+//! (see [`async_queue`]).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -122,6 +124,18 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if crate::host::host().is_some() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        if async_queue() {
+            let mut asked = Vec::new();
+            for &l in lists {
+                for segment in crate::list::segments(l) {
+                    let waits = segment.waits();
+                    asked.push(Asked::Push(this as usize, Item::Segment(segment, waits)));
+                }
+            }
+            account().submissions += 1;
+            let _ = ask(asked, Why::Submission);
+            return;
+        }
         let mut held = held();
         for &l in lists {
             for segment in crate::list::segments(l) {
@@ -170,6 +184,18 @@ fn held() -> std::sync::MutexGuard<'static, Holding> {
 /// Runs held work that may run now (`why` for the frame line).
 pub(crate) fn pump_held(why: Why) {
     #[cfg(windows)]
+    if async_queue() {
+        // Before a frame is shown, what was asked before it has run as far
+        // as it may (as without the worker); other callers only wake it.
+        match why {
+            Why::Present => drain(),
+            _ => {
+                let _ = ask(Vec::new(), why);
+            }
+        }
+        return;
+    }
+    #[cfg(windows)]
     pump(&mut held(), why);
     #[cfg(not(windows))]
     let _ = why;
@@ -179,11 +205,170 @@ pub(crate) fn pump_held(why: Why) {
 /// value, our timer).
 pub(crate) fn pump_held_if_free(why: Why) {
     #[cfg(windows)]
+    if async_queue() {
+        let _ = ask(Vec::new(), why);
+        return;
+    }
+    #[cfg(windows)]
     if let Ok(mut held) = HELD.try_lock() {
         pump(&mut held, why);
     }
     #[cfg(not(windows))]
     let _ = why;
+}
+
+/// `VICTORY_ASYNC_QUEUE=1`: the title's queue calls (lists, Signals,
+/// fence Waits) go to an inbox and return at once, and a worker thread of
+/// ours moves them into the held queues in their order and runs what may
+/// run, so the title records its next lists while the host GPU runs the
+/// last. As on the console, a queue's fence moves once the work before it
+/// has run, and the title, which waits for fences before it reuses what
+/// the GPU reads or reads what it wrote, waits for that. Off by default.
+#[cfg(windows)]
+pub(crate) fn async_queue() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_ASYNC_QUEUE").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("queues run on a worker thread (VICTORY_ASYNC_QUEUE)");
+        }
+        on
+    })
+}
+
+/// What the title asked of a queue, for the worker.
+#[cfg(windows)]
+enum Asked {
+    /// A segment or a fence Wait, behind what the queue holds.
+    Push(usize, Item<std::sync::Arc<crate::host::HostList>>),
+    /// A Signal (the fence kept alive until it is set).
+    Signal(usize, usize, u64),
+}
+
+/// The worker's inbox: what was asked, in order, whether the worker is
+/// running a pass, the first reason it was woken for, and how many calls
+/// asked of it and how many its finished passes took in.
+#[cfg(windows)]
+struct Inbox {
+    asked: std::collections::VecDeque<Asked>,
+    busy: bool,
+    woken: Option<Why>,
+    calls: u64,
+    done: u64,
+}
+
+#[cfg(windows)]
+static INBOX: std::sync::Mutex<Inbox> = std::sync::Mutex::new(Inbox {
+    asked: std::collections::VecDeque::new(),
+    busy: false,
+    woken: None,
+    calls: 0,
+    done: 0,
+});
+/// The worker waits here for something asked.
+#[cfg(windows)]
+static WAKE: std::sync::Condvar = std::sync::Condvar::new();
+/// Callers of [`drain`] wait here for the worker to be done.
+#[cfg(windows)]
+static IDLE: std::sync::Condvar = std::sync::Condvar::new();
+
+#[cfg(windows)]
+fn inbox() -> std::sync::MutexGuard<'static, Inbox> {
+    INBOX.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Puts `asked` in the inbox and wakes the worker (started on first use):
+/// the call's number, done once a pass that took it in has finished.
+#[cfg(windows)]
+fn ask(asked: Vec<Asked>, why: Why) -> u64 {
+    static WORKER: std::sync::Once = std::sync::Once::new();
+    WORKER.call_once(|| {
+        std::thread::Builder::new()
+            .name("victory queue worker".into())
+            .spawn(work)
+            .expect("the queue worker thread starts");
+    });
+    let mut inbox = inbox();
+    inbox.asked.extend(asked);
+    inbox.woken.get_or_insert(why);
+    inbox.calls += 1;
+    WAKE.notify_one();
+    inbox.calls
+}
+
+/// A queue's Signal: at once if nothing that queue was asked for is
+/// waiting or running, else behind it, through the worker.
+#[cfg(windows)]
+fn signal_async(queue: usize, fence: This, value: u64) {
+    {
+        let inbox = inbox();
+        // The worker takes `HELD` only while busy, which it marks under the
+        // inbox's lock: held here, it cannot start.
+        let idle = !inbox.busy && !inbox.asked.iter().any(|a| matches!(a, Asked::Push(q, _) | Asked::Signal(q, ..) if *q == queue));
+        if idle
+            && let Ok(held) = HELD.try_lock()
+            && !held.holds_work(queue)
+        {
+            crate::fence::set(fence, value);
+            drop(held);
+            drop(inbox);
+            // Another queue may wait for this fence.
+            let _ = ask(Vec::new(), Why::Signal);
+            return;
+        }
+    }
+    crate::fence::keep(fence);
+    let _ = ask(vec![Asked::Signal(queue, fence as usize, value)], Why::Signal);
+}
+
+/// Waits until the worker has run what was asked before this call as far
+/// as it may (work blocked on a wait stays held, as without the worker).
+#[cfg(windows)]
+fn drain() {
+    let call = ask(Vec::new(), Why::Present);
+    let mut inbox = inbox();
+    while inbox.done < call {
+        inbox = IDLE.wait(inbox).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+/// The worker: moves what was asked into the held queues, in order (a
+/// Signal at once when its queue holds nothing, as [`signal`] does), and
+/// runs what may run.
+#[cfg(windows)]
+fn work() {
+    loop {
+        let (asked, why, calls) = {
+            let mut inbox = inbox();
+            while inbox.asked.is_empty() && inbox.woken.is_none() {
+                inbox = WAKE.wait(inbox).unwrap_or_else(|e| e.into_inner());
+            }
+            inbox.busy = true;
+            let why = inbox.woken.take().unwrap_or(Why::Submission);
+            (std::mem::take(&mut inbox.asked), why, inbox.calls)
+        };
+        {
+            let mut held = held();
+            for a in asked {
+                match a {
+                    Asked::Push(queue, item) => held.push(queue, item),
+                    Asked::Signal(queue, fence, value) => {
+                        if held.holds_work(queue) {
+                            held.push(queue, Item::Signal(fence, value));
+                        } else {
+                            crate::fence::set(fence as This, value);
+                            crate::fence::let_go(fence as This);
+                        }
+                    }
+                }
+            }
+            pump(&mut held, why);
+        }
+        let mut inbox = inbox();
+        inbox.busy = false;
+        inbox.done = calls;
+        IDLE.notify_all();
+    }
 }
 
 /// How long a queue's head may wait before it runs anyway.
@@ -382,7 +567,9 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
         return E_INVALIDARG;
     }
     #[cfg(windows)]
-    {
+    if async_queue() {
+        signal_async(this as usize, fence, value);
+    } else {
         let mut held = held();
         if held.holds_work(this as usize) {
             crate::fence::keep(fence);
@@ -410,9 +597,13 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     }
     #[cfg(windows)]
     if crate::host::host().is_some() && crate::fence::value(fence) < value {
-        let mut held = held();
-        held.push(this as usize, Item::FenceWait(fence as usize, value));
-        pump(&mut held, Why::Wait);
+        if async_queue() {
+            let _ = ask(vec![Asked::Push(this as usize, Item::FenceWait(fence as usize, value))], Why::Wait);
+        } else {
+            let mut held = held();
+            held.push(this as usize, Item::FenceWait(fence as usize, value));
+            pump(&mut held, Why::Wait);
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, value);
