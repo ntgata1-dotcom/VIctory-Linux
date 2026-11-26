@@ -1,3 +1,9 @@
+# VIctory-Linux
+
+[VIctory](https://github.com/Marvisak/VIctory) with the fixes it needs on Linux merged in, and scripts to build and run it there under Wine: see **[LINUX.md](LINUX.md)**. The rest of this file is upstream's README, unchanged.
+
+---
+
 # VIctory
 
 Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
