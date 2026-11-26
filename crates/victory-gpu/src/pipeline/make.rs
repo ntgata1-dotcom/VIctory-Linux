@@ -418,6 +418,28 @@ mod tests {
         WAITING.fetch_sub(3, Ordering::Relaxed);
     }
 
+    /// A pipeline one wait gave up on is not waited for again: nothing makes
+    /// it here, so the first draw waits the frame's budget for it, and a
+    /// draw of a later frame not at all.
+    #[test]
+    fn a_pipeline_waited_for_in_vain_is_not_waited_for_again() {
+        let p = Pending::new(
+            Vec::new(),
+            None,
+            #[cfg(feature = "diagnostics")]
+            &[],
+        );
+        // Frames of its own, so the first has its whole budget.
+        let frame = u64::MAX - 1;
+        let started = Instant::now();
+        wait(&p, frame);
+        assert!(started.elapsed() >= GIVE_UP, "{:?}", started.elapsed());
+        assert!(p.given_up.load(Ordering::Relaxed));
+        let again = Instant::now();
+        wait(&p, frame - 1);
+        assert!(again.elapsed() < GIVE_UP / 10, "{:?}", again.elapsed());
+    }
+
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).
     #[test]
