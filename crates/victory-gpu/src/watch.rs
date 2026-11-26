@@ -197,11 +197,6 @@ struct Guards {
     /// with no question to the runtime (whose lock its page mappings hold
     /// for long).
     alias_of: BTreeMap<usize, Vec<usize>>,
-    /// `VICTORY_GUARD_REST`: guarded pages' faults since `rest_frame`, and
-    /// the pages that faulted often enough to rest unguarded ([`note_fault`]).
-    faulted: BTreeMap<usize, u32>,
-    hot: BTreeSet<usize>,
-    rest_frame: u64,
     /// Tracked pages written this frame and the frame before (diagnostics).
     #[cfg(feature = "diagnostics")]
     written: BTreeSet<usize>,
@@ -214,9 +209,6 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     holders: BTreeMap::new(),
     busy: Vec::new(),
     alias_of: BTreeMap::new(),
-    faulted: BTreeMap::new(),
-    hot: BTreeSet::new(),
-    rest_frame: 0,
     #[cfg(feature = "diagnostics")]
     written: BTreeSet::new(),
     #[cfg(feature = "diagnostics")]
@@ -680,9 +672,7 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
     };
     let mut taken = Vec::with_capacity(pages.len());
     let busy = |page: usize| g.busy.iter().any(|&(a, b)| (a..b).contains(&page));
-    // Resting pages are left open as busy ones are: not taken, they stay
-    // changed in every tracker holding them (see `note_fault`).
-    let pages: Vec<usize> = pages.iter().copied().filter(|&p| !busy(p) && !g.hot.contains(&p)).collect();
+    let pages: Vec<usize> = pages.iter().copied().filter(|&p| !busy(p)).collect();
     let mut i = 0;
     while i < pages.len() {
         if g.protected.contains(&pages[i]) {
@@ -922,9 +912,6 @@ fn install() {
         if changed(&mut g, at / PAGE, at / PAGE + 1, true) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
-            if rest() {
-                note_fault(&mut g, at / PAGE);
-            }
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {
@@ -938,42 +925,6 @@ fn install() {
     ONCE.call_once(|| unsafe {
         AddVectoredExceptionHandler(1, Some(on_write));
     });
-}
-
-/// `VICTORY_GUARD_REST=1`: pages the title writes again and again rest
-/// unguarded for a while instead of faulting at each first write after a
-/// copy took them (about 1,200 faults a world frame on Linux, each a signal,
-/// this lock and two protection changes). Off by default.
-fn rest() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_REST").is_some_and(|v| v == "1"))
-}
-
-/// Faults of one page, since the rest began, that make it rest.
-const HOT_AFTER: u32 = 2;
-/// Frames a rest lasts: then every page is guarded again when next taken.
-const REST_FRAMES: u64 = 30;
-
-/// A guarded page faulted: counted, and once it has faulted [`HOT_AFTER`]
-/// times it rests, with the pages showing the same memory. Resting pages
-/// are not guarded ([`protect_noting`] leaves them out), so they stay
-/// changed in every tracker holding them: this fault marked them all, and
-/// nothing takes them while they rest, so every copy copies them at every
-/// refresh, and none can miss a write. At the end of the rest they are
-/// still changed everywhere, and the next take guards them again.
-fn note_fault(g: &mut Guards, page: usize) {
-    let frame = crate::frame::current();
-    if frame.saturating_sub(g.rest_frame) >= REST_FRAMES {
-        g.rest_frame = frame;
-        g.faulted.clear();
-        g.hot.clear();
-    }
-    let n = g.faulted.entry(page).or_insert(0);
-    *n += 1;
-    if *n >= HOT_AFTER && g.hot.insert(page) {
-        let others: Vec<usize> = g.alias_of.get(&page).cloned().unwrap_or_default();
-        g.hot.extend(others);
-    }
 }
 
 /// Whether `at` is committed read-write memory now.
