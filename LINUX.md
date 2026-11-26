@@ -39,13 +39,27 @@ Looked at and not taken, so nobody has to look again:
 
 ## Status
 
-Measured on one machine: Arch Linux, RX 9070 XT (RDNA4), RADV / Mesa 26.3, Wine 11.22, vkd3d-proton and DXVK `dxgi` from GE-Proton11-14.
+Measured on one machine: Arch Linux, Ryzen 9 7900X, RX 9070 XT (RDNA4), RADV / Mesa 26.3, Wine 11.22, vkd3d-proton and DXVK `dxgi` from GE-Proton11-14. This tree, 2026-11-26:
 
-- **Menus** run at the title's 30 fps.
-- **The world** draws with #1279, which #2913 carries. Without it the world is black under Wine's own compiler. The first mission's cutscene shows streets, buildings, lights, characters and a car. Surfaces are unlit, characters show broken geometry, and frames took 3.1 s on average. [Measurements](https://github.com/Marvisak/VIctory/pull/1279#issuecomment-7168463210)
-- **Runs end** about 7½ minutes into the world on the title's own `0x80000003`. [#698](https://github.com/Marvisak/VIctory/issues/698) reports the same stop on Windows.
-- **This exact tree in the world:** not run yet. #1279's result was measured on an older `main`.
-- **Tests:** on Linux, `cargo test --workspace` passes (457 tests). The Windows build's tests run under Wine pass 9 that fail on upstream `main` there. The 28 that fail on both need things Wine lacks. One timing test (`frame::tests::waits_end_on_ticks_and_count_frames`) can fail on a busy machine, on upstream too.
+- **Gameplay:** the first mission's opening plays through and hands over control. The character walks and the camera turns, about 11 minutes after launch.
+- **The world** draws lit: streets, buildings, lights, a car, foliage, the far view. Characters' faces and skin aren't drawn (hair and accessories are), and a few interiors have blocky white tiles.
+- **The pool-full stop** ([#698](https://github.com/Marvisak/VIctory/issues/698)): with Wine's own wineserver it came 5 minutes into the world, and `VICTORY_STEP_OVER` carried the run on (over 1,000 steps, no fault). With the faster wineserver below the pool didn't fill before control.
+- **Stability:** a 30-minute run ended on its time limit, with no crash, no GPU fault and nothing in the kernel log.
+- **Tests:** on Linux, `cargo test --workspace` passes (461 tests). The Windows build's tests run under Wine pass 9 that fail on upstream `main` there. The 28 that fail on both need things Wine lacks. One timing test (`frame::tests::waits_end_on_ticks_and_count_frames`) can fail on a busy machine, on upstream too.
+
+## Speed
+
+World frames in the opening cutscene, the same save each time:
+
+| Run | Build | wineserver | Shader cache | ms per frame |
+|---|---|---|---|---|
+| A | diagnostics | Wine's own | cold | 1,880 |
+| B | diagnostics | [`linux/build-wineserver.sh`](linux/build-wineserver.sh) | cold (vkd3d-proton's warm) | 842 |
+| C | release | `linux/build-wineserver.sh` | [`linux/warm-cache.sh`](linux/warm-cache.sh) | 791 |
+
+- **The wineserver is the big one.** VIctory maps the title's memory as tens of thousands of views, and Wine's server walks all of them on every map and unmap. Kept in a tree, the server went from about 56 % of a core to 3 %.
+- **The warm cache** takes shader translation (about 13 % of the CPU in a profile) and pipeline building out of the run, and draws are no longer dropped while their pipelines are made.
+- **What's left is VIctory's design, on every platform:** Windows testers report 0.8–0.9 s a frame too ([#400](https://github.com/Marvisak/VIctory/issues/400)). `Host::execute` runs one submission at a time, from preparing through the GPU to copying back, and waits for each. In run C the whole process used under one core and the GPU was busy about a quarter of the time: they take turns rather than overlap.
 
 ## Build
 
