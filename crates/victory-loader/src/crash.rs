@@ -570,8 +570,9 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
 /// at these image offsets are stepped over instead of ending the run, with
 /// how often each was hit. Grand Theft Auto VI 1.0.2.1's pool allocates trap
 /// on an empty pool right before returning NULL (`+0x5149aec`, `+0x63966f`,
-/// #698): stepped over, the allocation fails and the title goes on.
-#[cfg(feature = "diagnostics")]
+/// #698): stepped over, the allocation fails and the title goes on. In
+/// release builds too (this fork): runs past that stop are how the world is
+/// played on Linux, and the release build is the faster one.
 static STEP_OVER: std::sync::OnceLock<Vec<(usize, std::sync::atomic::AtomicU64)>> =
     std::sync::OnceLock::new();
 
@@ -580,7 +581,6 @@ static STEP_OVER: std::sync::OnceLock<Vec<(usize, std::sync::atomic::AtomicU64)>
 ///
 /// # Safety
 /// `info` comes from the system, for an exception being dispatched.
-#[cfg(feature = "diagnostics")]
 unsafe fn step_over(info: *mut EXCEPTION_POINTERS) -> bool {
     use windows_sys::Win32::System::Memory::{MEM_IMAGE, MEMORY_BASIC_INFORMATION, VirtualQuery};
     let list = STEP_OVER.get_or_init(|| {
@@ -639,7 +639,6 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     if unsafe { emulate_amd_only(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
-    #[cfg(feature = "diagnostics")]
     // SAFETY: as above.
     if unsafe { step_over(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION

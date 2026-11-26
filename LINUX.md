@@ -18,7 +18,7 @@ Open upstream pull requests, merged with their original commits and authors:
 | [#1722](https://github.com/Marvisak/VIctory/pull/1722) | The host pipeline library works under vkd3d-proton, so pipelines are kept between runs | Impre-visible |
 | [#2101](https://github.com/Marvisak/VIctory/pull/2101) | The one castable format vkd3d-proton has no mapping for is left out, so it no longer refuses castable formats altogether | Deilach |
 | [#2249](https://github.com/Marvisak/VIctory/pull/2249) | Two network functions Wine's `ws2_32` lacks fail cleanly instead of aborting | slaktarn, opened by desplmfao |
-| [#2644](https://github.com/Marvisak/VIctory/pull/2644) | Diagnostics build: `VICTORY_STEP_OVER=63966f,5149aec` steps over the title's pool-full stop ([#698](https://github.com/Marvisak/VIctory/issues/698)) | Pierrot1398 |
+| [#2644](https://github.com/Marvisak/VIctory/pull/2644) | `VICTORY_STEP_OVER=63966f,5149aec` steps over the title's pool-full stop ([#698](https://github.com/Marvisak/VIctory/issues/698)). Here in release builds too, not only diagnostics ones | Pierrot1398 |
 | [#454](https://github.com/Marvisak/VIctory/pull/454) | `VICTORY_NO_WATCHDOG=1` keeps the title's watchdog from ending a slow run ([#1118](https://github.com/Marvisak/VIctory/issues/1118)) | ruvenesh |
 | [#2195](https://github.com/Marvisak/VIctory/pull/2195) | Tests: the library test's shaders compile with Wine's compiler | winne42 |
 | [#2973](https://github.com/Marvisak/VIctory/pull/2973), six of its commits | Crash records stay whole under Wine; five tests that assumed Windows or one GPU | neonbyte1 |
