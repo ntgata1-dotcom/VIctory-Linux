@@ -1033,6 +1033,22 @@ struct Deferred {
 }
 
 impl Host {
+    /// Waits until the host queue has done all work submitted so far,
+    /// presents included (tests).
+    #[cfg(test)]
+    pub(crate) fn wait_idle(&self) {
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        *submitted += 1;
+        // SAFETY: the queue, fence and event are ours and alive.
+        unsafe {
+            self.queue.Signal(&self.fence, *submitted).unwrap();
+            self.fence
+                .SetEventOnCompletion(*submitted, self.event)
+                .unwrap();
+            WaitForSingleObject(self.event, INFINITE);
+        }
+    }
+
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
     pub(crate) fn mesh_shaders(&self) -> bool {

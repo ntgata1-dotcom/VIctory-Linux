@@ -824,6 +824,12 @@ mod tests {
             _rest: [0; 6],
         });
         assert_eq!(present(null, 2, planes.as_ptr(), null.cast()), S_OK);
+        // The first present makes its swap chain on vkd3d-proton's queue
+        // thread after Present returns. A process that exits while the
+        // driver is still making it can hang in the NVIDIA driver's exit
+        // handler under Wine and be killed
+        // (HansKristian-Work/vkd3d-proton#3524): let it finish.
+        host.wait_idle();
         let restored = primary.state.load(Ordering::Relaxed);
         let release = |resource| slot::<extern "system" fn(This) -> u32>(resource, 0x10)(resource);
         for resource in resources {
