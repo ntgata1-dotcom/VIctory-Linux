@@ -56,9 +56,13 @@ World frames in the opening cutscene, the same save each time:
 | A | diagnostics | Wine's own | cold | 1,880 |
 | B | diagnostics | [`linux/build-wineserver.sh`](linux/build-wineserver.sh) | cold (vkd3d-proton's warm) | 842 |
 | C | release | `linux/build-wineserver.sh` | [`linux/warm-cache.sh`](linux/warm-cache.sh) | 791 |
+| E | diagnostics, `VICTORY_ASYNC_QUEUE=1` | `linux/build-wineserver.sh` | warm | 856 (median) |
+| F | as E, with pipelines given up on | `linux/build-wineserver.sh` | warm | **439** (median), 206 at best |
 
 - **The wineserver is the big one.** VIctory maps the title's memory as tens of thousands of views, and Wine's server walks all of them on every map and unmap. Kept in a tree, the server went from about 56 % of a core to 3 %.
 - **The warm cache** takes shader translation (about 13 % of the CPU in a profile) and pipeline building out of the run, and draws are no longer dropped while their pipelines are made.
+- **A pipeline that never finishes cost every frame half a second.** Draws wait for a pipeline being made, up to 500 ms a frame, and a few of the pack's pipelines never finish under vkd3d-proton (22 of 27,160 here). Stack dumps of the title's threads in the world showed one recording thread waiting in `pipeline::make::ready` and every other title thread waiting on it. Now a pipeline one wait has spent 100 ms on in vain isn't waited for again: 1.5–2.1× faster frames, depending on the scene (E against F, at matching draw counts).
+- **The queues can run on a worker thread** (`VICTORY_ASYNC_QUEUE=1`, off by default), so the title records its next lists while the GPU runs the last. Alone it didn't change frame times: the pipeline wait above held the title back.
 - **What's left is VIctory's design, on every platform:** Windows testers report 0.8–0.9 s a frame too ([#400](https://github.com/Marvisak/VIctory/issues/400)). `Host::execute` runs one submission at a time, from preparing through the GPU to copying back, and waits for each. In run C the whole process used under one core and the GPU was busy about a quarter of the time: they take turns rather than overlap.
 
 ## Build
