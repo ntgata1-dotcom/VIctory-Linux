@@ -6,15 +6,36 @@ You need your own copy of the game. Nothing from the game is in this repository,
 
 ## What is merged on top of upstream
 
-Each is an open upstream pull request, merged with its original commits and authors:
+Open upstream pull requests, merged with their original commits and authors:
 
 | Upstream PR | What it does on Linux | Author |
 |---|---|---|
 | [#2913](https://github.com/Marvisak/VIctory/pull/2913) (carries [#1279](https://github.com/Marvisak/VIctory/pull/1279)) | The indirect-argument clamp is a shader Wine's own `d3dcompiler_47` can build. Without it every indirect draw is dropped and the world stays black | arogan178 (Andrea Bugeja), carrying Mumogg's #1279 |
+| [#2919](https://github.com/Marvisak/VIctory/pull/2919) | The depth converter (16-bit depth the title writes through unordered views) is one Wine's compiler builds too | arogan178 (Andrea Bugeja) |
+| [#2723](https://github.com/Marvisak/VIctory/pull/2723) (carries [#177](https://github.com/Marvisak/VIctory/pull/177)) | A resource read as float and used by an atomic gets a handle of each type, as the host needs. Merged for the startup abort in dxil-spirv (`Invalid type ID in cast<T>`) that current `main` hits under Wine; that it is the fix is not yet checked on its own | andyeox-systemd, with Ortomanic and gingertonik |
+| [#2977](https://github.com/Marvisak/VIctory/pull/2977) | Loops are shaped as DXC shapes them, so dxil-spirv doesn't recurse until its stack runs out on 9 of the title's programs | neonbyte1 |
+| [#2703](https://github.com/Marvisak/VIctory/pull/2703) | A root constant's fifth dword is a value, not a view offset, so those draws aren't dropped | Calvix2k |
 | [#1722](https://github.com/Marvisak/VIctory/pull/1722) | The host pipeline library works under vkd3d-proton, so pipelines are kept between runs | Impre-visible |
 | [#2101](https://github.com/Marvisak/VIctory/pull/2101) | The one castable format vkd3d-proton has no mapping for is left out, so it no longer refuses castable formats altogether | Deilach |
 | [#2249](https://github.com/Marvisak/VIctory/pull/2249) | Two network functions Wine's `ws2_32` lacks fail cleanly instead of aborting | slaktarn, opened by desplmfao |
+| [#2644](https://github.com/Marvisak/VIctory/pull/2644) | Diagnostics build: `VICTORY_STEP_OVER=63966f,5149aec` steps over the title's pool-full stop ([#698](https://github.com/Marvisak/VIctory/issues/698)) | Pierrot1398 |
+| [#454](https://github.com/Marvisak/VIctory/pull/454) | `VICTORY_NO_WATCHDOG=1` keeps the title's watchdog from ending a slow run ([#1118](https://github.com/Marvisak/VIctory/issues/1118)) | ruvenesh |
+| [#2195](https://github.com/Marvisak/VIctory/pull/2195) | Tests: the library test's shaders compile with Wine's compiler | winne42 |
+| [#2973](https://github.com/Marvisak/VIctory/pull/2973), six of its commits | Crash records stay whole under Wine; five tests that assumed Windows or one GPU | neonbyte1 |
 | [#2334](https://github.com/Marvisak/VIctory/pull/2334) (carries [#1017](https://github.com/Marvisak/VIctory/pull/1017)) | The workspace builds, passes clippy and tests on Linux, for development | Jitheswar, carried by ntgata1-dotcom |
+
+From other forks (GPL-3.0-or-later, as VIctory):
+
+| Change | From | Author |
+|---|---|---|
+| A wave64 lane mask copied a dword at a time through scalar moves is still its compare's mask, so the program structures | [DexNom/VIctory](https://github.com/DexNom/VIctory) `76749ce`, adapted to upstream | DexNom |
+
+Looked at and not taken, so nobody has to look again:
+
+- **In-place title memory** (Belobug and its descendants, avatarmanz's speedups): under Wine the world goes black with it.
+- **DexNom's ray-structure building**: it rests on the in-place memory above and a rewrite of the GPU memory code, not a change on its own.
+- **uiliannn's barrier change**: it drops the thread-group sync of every barrier after any loop, so compute programs race.
+- **uiliannn's submission chunking**: the indirect budget it cuts by 8 drops real draws.
 
 ## Status
 
