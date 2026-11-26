@@ -42,6 +42,9 @@ pub(crate) struct Pending {
     /// whether a draw has used it yet.
     pub(crate) key: String,
     used: AtomicBool,
+    /// Whether a draw already waited [`GIVE_UP`] for it in vain: later
+    /// draws do not wait for it (see [`wait`]).
+    given_up: AtomicBool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -81,6 +84,7 @@ impl Pending {
             #[cfg(feature = "diagnostics")]
             skipped_shader,
             used: AtomicBool::new(false),
+            given_up: AtomicBool::new(false),
         }
     }
 
@@ -233,8 +237,27 @@ pub(crate) fn early(p: &Arc<Pending>) {
     }
 }
 
-/// Waits for `p` while frame `frame` has budget left.
+/// How long one wait for a pipeline may last in vain before later draws
+/// stop waiting for it. A pipeline the host's compiler takes seconds for,
+/// or never finishes (some do under vkd3d-proton), otherwise cost every
+/// frame the whole [`BUDGET`]: in the world on Linux the title's threads
+/// all stood behind one such wait, about 500 ms of a 0.9 s frame. Given
+/// up, it is still made in the background, and its draws are dropped until
+/// then, as they are once the budget is spent. `VICTORY_PIPELINE_GIVE_UP=0`
+/// waits as before.
+const GIVE_UP: Duration = Duration::from_millis(100);
+
+fn give_up() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_GIVE_UP").is_none_or(|v| v != "0"))
+}
+
+/// Waits for `p` while frame `frame` has budget left, unless an earlier
+/// wait for it gave up.
 fn wait(p: &Pending, frame: u64) {
+    if p.given_up.load(Ordering::Relaxed) {
+        return;
+    }
     static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
     static WAITED_US: AtomicU64 = AtomicU64::new(0);
     if FRAME.swap(frame, Ordering::Relaxed) != frame {
@@ -251,7 +274,15 @@ fn wait(p: &Pending, frame: u64) {
         }
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
-    WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    let waited = started.elapsed();
+    WAITED_US.fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
+    if p.made.get().is_none() && waited >= GIVE_UP && give_up() && !p.given_up.swap(true, Ordering::Relaxed) {
+        tracing::info!(
+            ms = waited.as_millis() as u64,
+            key = %p.key,
+            "a pipeline waited for in vain: later draws do not wait for it (VICTORY_PIPELINE_GIVE_UP=0: they do)"
+        );
+    }
 }
 
 /// Pipelines for the workers: those draws wait for, then those started
