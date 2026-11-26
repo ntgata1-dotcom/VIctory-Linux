@@ -485,29 +485,32 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 /// plane and back, in the scratch buffer: `u` becomes `u` times
 /// `0x37800080` (the title's 1/65535; its tiled-lighting draws rasterise
 /// that very float and test it EQUAL), and a float back the nearest `u`.
+///
+/// Wine's compiler has no methods on byte address buffers and ignores a
+/// `RootSignature` attribute, so the buffer is one of `uint`, indexed in
+/// words, and the root signature is made beside the shader.
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=8, b0), UAV(u0)"
 cbuffer C : register(b0) { uint width; uint height; uint pitch16; uint at16; uint pitch32; uint at32; uint toDepth; uint unused; };
-RWByteAddressBuffer buf : register(u0);
+// Offsets and pitches are in bytes, all multiples of 4 (placed footprints).
+RWStructuredBuffer<uint> buf : register(u0);
 uint depth(uint u) { return asuint((float)u * asfloat(0x37800080)); }
 uint u16(uint d) { return (uint)(saturate(asfloat(d)) * 65535.0 + 0.5); }
-[RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     uint x = id.x * 2;
     uint y = id.y;
     if (x >= width || y >= height) return;
-    uint a = at16 + y * pitch16 + x * 2;
-    uint b = at32 + y * pitch32 + x * 4;
+    uint a = (at16 + y * pitch16 + x * 2) / 4;
+    uint b = (at32 + y * pitch32 + x * 4) / 4;
     bool two = x + 1 < width;
     if (toDepth != 0) {
-        uint pair = buf.Load(a);
-        buf.Store(b, depth(pair & 0xffff));
-        if (two) buf.Store(b + 4, depth(pair >> 16));
+        uint pair = buf[a];
+        buf[b] = depth(pair & 0xffff);
+        if (two) buf[b + 1] = depth(pair >> 16);
     } else {
-        uint lo = u16(buf.Load(b));
-        uint hi = two ? u16(buf.Load(b + 4)) : 0;
-        buf.Store(a, lo | hi << 16);
+        uint lo = u16(buf[b]);
+        uint hi = two ? u16(buf[b + 1]) : 0;
+        buf[a] = lo | hi << 16;
     }
 }
 "#;
@@ -551,16 +554,62 @@ fn compile() -> windows::core::Result<Converter> {
         return Err(e);
     }
     let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
+    let root = root_signature(device)?;
+    // SAFETY: the blob's own bytes.
     unsafe {
         let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() },
             ..Default::default()
         })?;
         Ok(Converter { root, pso })
+    }
+}
+
+/// The converter's root signature: its constants (b0), then the scratch
+/// buffer (u0).
+fn root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSignature> {
+    let params = [
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 8 },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        },
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 0, RegisterSpace: 0 },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        },
+    ];
+    let desc = D3D12_ROOT_SIGNATURE_DESC {
+        NumParameters: params.len() as u32,
+        pParameters: params.as_ptr(),
+        ..Default::default()
+    };
+    let mut blob: Option<ID3DBlob> = None;
+    let mut errors: Option<ID3DBlob> = None;
+    // SAFETY: the description points at a live array; out pointers ours;
+    // the blobs' own bytes.
+    unsafe {
+        let bytes = |b: &ID3DBlob| {
+            std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize())
+        };
+        let serialized =
+            D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &mut blob, Some(&mut errors));
+        if let Err(e) = serialized {
+            if let Some(errors) = errors {
+                let text = String::from_utf8_lossy(bytes(&errors));
+                tracing::warn!("depth conversion root signature: {text}");
+            }
+            return Err(e);
+        }
+        let blob = blob.ok_or_else(windows::core::Error::empty)?;
+        device.CreateRootSignature(0, bytes(&blob))
     }
 }
 
@@ -644,5 +693,70 @@ mod tests {
         // What the list left is what the next prelude starts from.
         assert_eq!(states[&key(&depth)], depth.state.load(Relaxed));
         assert_eq!(states[&key(&twin.planes[0])], twin.planes[0].state.load(Relaxed));
+    }
+
+    /// The converter builds with the system's compiler (Wine's too) and
+    /// turns 16-bit depth into the host's float depth and back.
+    #[test]
+    fn the_converter_turns_16_bit_depth_into_float_and_back() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let c = converter().expect("depth converter");
+        let (buf, data) = host.shared_buffer(512).unwrap();
+        let list = host.new_list().unwrap();
+        // 3x4 depth, an odd width: 16-bit at 0 (pitch 8), float at 256
+        // (pitch 16). Each row has one texel's room left over on each side.
+        let run = |to_depth: u32| {
+            let constants = [3u32, 4, 8, 0, 16, 256, to_depth, 0];
+            // SAFETY: an open list, our converter and buffer.
+            unsafe {
+                list.list.SetComputeRootSignature(&c.root);
+                list.list.SetPipelineState(&c.pso);
+                list.list.SetComputeRootUnorderedAccessView(1, buf.GetGPUVirtualAddress());
+                list.list.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
+                list.list.Dispatch(1, 4, 1);
+                list.list.ResourceBarrier(&[uav_barrier()]);
+            }
+            list.close();
+            host.execute(&[&list]);
+        };
+        let u16s = data.cast::<u16>();
+        let f32s = data.wrapping_add(256).cast::<u32>();
+        // SAFETY: texels 0..16 of each side lie inside our mapped 512-byte
+        // buffer, written before a list runs and read after it has.
+        let (put16, get16) = (|i, v| unsafe { u16s.add(i).write_volatile(v) }, |i| unsafe { u16s.add(i).read_volatile() });
+        // SAFETY: as above.
+        let (put32, get32) = (|i, v| unsafe { f32s.add(i).write_volatile(v) }, |i| unsafe { f32s.add(i).read_volatile() });
+        // Texel `i` (row-major, 4 to a row); the fourth of a row is padding.
+        let texels = || (0..16usize).filter(|i| i % 4 != 3);
+        const PAD: u32 = 0xdead_beef;
+        for i in 0..16 {
+            put16(i, 0x100 * i as u16 + 1);
+            put32(i, PAD);
+        }
+        run(1);
+        for i in texels() {
+            let want = (f32::from(0x100 * i as u16 + 1) * f32::from_bits(0x3780_0080)).to_bits();
+            assert_eq!(get32(i), want, "float depth at texel {i}");
+        }
+        for i in (3..16).step_by(4) {
+            assert_eq!(get32(i), PAD, "float padding after row {}", i / 4);
+        }
+        // Back: texel i is i/16, the nearest 16-bit value i * 65535 / 16.
+        for i in 0..16 {
+            put16(i, 0xffff);
+            put32(i, (i as f32 / 16.0).to_bits());
+        }
+        list.reset();
+        run(0);
+        for i in texels() {
+            let want = (i as f32 / 16.0 * 65535.0 + 0.5) as u16;
+            assert_eq!(get16(i), want, "16-bit depth at texel {i}");
+        }
+        for i in (3..16).step_by(4) {
+            // The last pair of an odd row is written whole, its second half 0.
+            assert_eq!(get16(i), 0, "16-bit padding after row {}", i / 4);
+        }
     }
 }
