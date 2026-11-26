@@ -195,6 +195,8 @@
 //!   the console's, without `SV_PrimitiveID` and `SV_CullPrimitive` (the
 //!   console never exports them).
 
+#[cfg(test)]
+mod annotation_tests;
 mod bitcode;
 #[cfg(test)]
 mod census_tests;
@@ -209,6 +211,8 @@ mod diff_tests;
 mod flow_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(test)]
+mod latch_tests;
 mod lower;
 mod rect;
 pub use rect::{rectangle_gs, right_angle};

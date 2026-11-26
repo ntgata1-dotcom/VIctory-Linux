@@ -76,6 +76,9 @@ pub(crate) struct Lowered {
     /// Test builds: the headers each written block branches back to.
     #[cfg(test)]
     pub back_edges: Vec<Vec<usize>>,
+    /// Test builds: the property words of each handle annotation, in order.
+    #[cfg(test)]
+    pub annotations: Vec<(u32, u32)>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -218,15 +221,15 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    handles: HashMap<(usize, Site, u8, bool, u32, u32), V>,
     /// Handles made in the entry block for descriptors at addresses the
     /// root parameters alone give (table and heap loads with no other
     /// term), by base value, byte offset, dword, offset register, sampler
     /// heap and properties ([`Lower::entry_address`]).
-    entry_handles: HashMap<(EntryAddress, u8, bool, u32), V>,
+    entry_handles: HashMap<(EntryAddress, u8, bool, u32, u32), V>,
     /// Handles of descriptors chosen by control flow, made in their join
     /// block, by the choice (its `Debug` text), sampler heap and properties.
-    join_handles: HashMap<(String, bool, u32), V>,
+    join_handles: HashMap<(String, bool, u32, u32), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -1394,6 +1397,8 @@ impl<'a> Lower<'a> {
         let view_addresses = self.s.view_addresses.is_some();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
+            #[cfg(test)]
+            annotations: std::mem::take(&mut self.s.annotations),
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -5374,7 +5379,7 @@ impl<'a> Lower<'a> {
                 // compiler reloads one before every use rather than keep it
                 // (ActivateRays: 2,399 loads of one), and one handle made in
                 // the entry block serves them all.
-                let key = (address, *first, sampler, props.0);
+                let key = (address, *first, sampler, props.0, props.1);
                 if let Some(&h) = self.entry_handles.get(&key) {
                     return Ok(h);
                 }
@@ -5387,7 +5392,10 @@ impl<'a> Lower<'a> {
                 Ok(h)
             }
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                // The element type is part of the key: one UAV read as float
+                // and used atomically needs two handles (an atomic on a float
+                // handle is invalid and crashed the NVIDIA compiler).
+                let key = (self.cur, *load, *first, sampler, props.0, props.1);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
@@ -5496,7 +5504,7 @@ impl<'a> Lower<'a> {
                 // One handle at the join for every access the choice reaches
                 // (each is in a block the join dominates).
                 let _ = site;
-                let key = (format!("{src:?}"), sampler, props.0);
+                let key = (format!("{src:?}"), sampler, props.0, props.1);
                 if let Some(&h) = self.join_handles.get(&key) {
                     return Ok(h);
                 }
@@ -12253,32 +12261,5 @@ mod tests {
             lowers(&words, 0),
             Err(crate::ShaderError::Unsupported { what: "GDS", .. })
         ));
-    }
-
-    /// A latch that branches back to both its loop's header and the outer
-    /// loop's (the shape of a first-lane table offset loop) branches back to
-    /// one header only: the outer back edge leaves through a latch of its own
-    /// (dxil-spirv#380).
-    #[test]
-    fn a_latch_branches_back_to_one_header() {
-        let words = [
-            0xBE80_0380, // s_mov_b32 s0, 0
-            0xBF82_0007, // s_branch outer
-            0x8001_8101, // latch: s_add_u32 s1, s1, 1
-            0xBF06_8301, // s_cmp_eq_u32 s1, 3
-            0xBF85_0004, // s_cbranch_scc1 outer
-            0x8000_8100, // inner: s_add_u32 s0, s0, 1
-            0xBF06_8400, // s_cmp_eq_u32 s0, 4
-            0xBF85_0003, // s_cbranch_scc1 end
-            0xBF82_FFF9, // s_branch latch
-            0xBE81_0380, // outer: s_mov_b32 s1, 0
-            0xBF82_FFFA, // s_branch inner
-            S_ENDPGM,    // end
-        ];
-        let l = lower_with(&words, vec![], vec![]).unwrap();
-        let back = &l.back_edges;
-        assert!(back.iter().all(|b| b.len() <= 1), "{back:?}");
-        // Its own latch and the outer loop's.
-        assert_eq!(back.iter().filter(|b| !b.is_empty()).count(), 2);
     }
 }
