@@ -20,3 +20,12 @@ export VICTORY_GAME_EXE='game_scarlett_master.exe'
 # VIctory's cache and data (saves, settings, crashes.log): outside this repo.
 export VICTORY_CACHE_DIR='Z:\home\you\.cache\victory'
 export VICTORY_DATA_DIR='Z:\home\you\.local\share\victory\data'
+
+# Speed: the wineserver linux/build-wineserver.sh builds (memory views in a
+# tree). run.sh starts it for the prefix; without it, Wine's own is used.
+#export VICTORY_WINESERVER="$HOME/.local/share/victory/wineserver/wineserver"
+
+# Getting through the opening on Series 1.0.2.1 (#698, #1118): step over the
+# title's pool-full stop, and keep its watchdog from ending a slow run.
+export VICTORY_STEP_OVER=63966f,5149aec
+export VICTORY_NO_WATCHDOG=1

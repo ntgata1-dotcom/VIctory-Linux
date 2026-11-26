@@ -12,6 +12,12 @@ logs="$here/logs"; mkdir -p "$logs"; tag=$(date +%Y%m%d-%H%M%S)
 journalctl -k -f -n 0 --no-pager 2>/dev/null | grep --line-buffered -iE 'amdgpu|nouveau|nvidia|i915|xe |gpu reset|ring .* timeout' > "$logs/$tag-kernel.log" &
 klog=$!
 trap 'kill $klog 2>/dev/null; wineserver -k 2>/dev/null' EXIT
+if [ -n "${VICTORY_WINESERVER:-}" ]; then
+    # Wine looks in its own bin dir before $WINESERVER, so start ours for the
+    # prefix first: wine then connects to the server already running.
+    wineserver -k 2>/dev/null || true
+    "$VICTORY_WINESERVER" -p 60 || { echo "could not start $VICTORY_WINESERVER" >&2; exit 1; }
+fi
 echo "logging to $logs/$tag.log (kernel GPU messages: $logs/$tag-kernel.log)"
 systemd-run --user --scope -q -p MemoryMax="${VICTORY_MEMORY_MAX:-24G}" -- \
     timeout -k 15 "$secs" wine "$exe" run "$VICTORY_GAME_DIR\\$VICTORY_GAME_EXE" --execute \
