@@ -1,0 +1,60 @@
+name: Linux
+
+# What this fork adds to upstream's CI (ci.yml, Windows): the workspace on a
+# Linux host, and victory.exe cross-built there the way LINUX.md builds it.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  native:
+    name: Clippy and tests on Linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      # The version and components pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Clippy, diagnostics build
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # Includes xtask's repository_passes_policy, the asset-policy check.
+      - name: Tests
+        run: cargo test --workspace --locked
+      - name: Scripts parse
+        run: for f in linux/*.sh; do bash -n "$f"; done
+
+  cross:
+    name: victory.exe cross-built with cargo-xwin
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: xwin
+      - name: Tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq clang lld llvm
+          cargo install --locked cargo-xwin
+      # cargo-xwin downloads Microsoft's CRT and Windows SDK (their license).
+      - name: Release build
+        run: linux/build.sh release
+      - name: Diagnostics build
+        run: linux/build.sh diag
