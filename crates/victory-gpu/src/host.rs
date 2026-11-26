@@ -2483,11 +2483,8 @@ impl Batch {
 }
 
 /// A batch's refreshes of this many or more go to [`refresh_pool`]'s threads
-/// as well as the caller's (`VICTORY_REFRESH_THREADS=<n>`, with the
-/// caller's; unset or 1, on the caller alone). Off by default: in the world
-/// on Linux, 8 threads took preparing from 255 to 228 ms a frame and frame
-/// times didn't move; the refreshes' summed time went from 132 to 632 ms,
-/// so they mostly wait on each other (the guards, see `crate::watch`).
+/// as well as the caller's (`VICTORY_REFRESH_THREADS`, with the caller's:
+/// half the logical processors, 2 to 8; 1 refreshes on the caller alone).
 /// A world frame refreshes about 17,700 host copies, mostly small, one after
 /// another: with the queue worker that work is the frame's wall.
 const SPREAD_FROM: usize = 16;
@@ -2623,7 +2620,9 @@ fn refresh_pool() -> Option<&'static RefreshPool> {
     static POOL: OnceLock<Option<RefreshPool>> = OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
     let threads = || {
-        std::env::var("VICTORY_REFRESH_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(1).min(16)
+        std::env::var("VICTORY_REFRESH_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or_else(|| {
+            std::thread::available_parallelism().map_or(4, |n| n.get() / 2).clamp(2, 8)
+        })
     };
     let pool = POOL
         .get_or_init(|| (threads() > 1).then(|| RefreshPool { job: Mutex::new(None), ready: std::sync::Condvar::new() }))
