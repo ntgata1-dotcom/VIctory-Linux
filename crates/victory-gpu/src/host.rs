@@ -4,7 +4,7 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -2512,7 +2512,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let _writing = title_dst.then(|| crate::watch::writing(dst as usize, len));
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read_wide(src, dst, len);
+    let whole = read(src, dst, len);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -2565,137 +2565,6 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
 }
 
-/// Copies at least this large go in [`PIECE`]s to [`copy_pool`]'s threads
-/// and the caller's: a world frame copies 450-700 MB of title memory to
-/// and from the host, which one thread did at about 6 GB/s.
-const WIDE: usize = 8 << 20;
-/// What one thread of [`read_wide`] copies at a time.
-const PIECE: usize = 2 << 20;
-
-/// [`read`] of `len` bytes, in pieces on our copy threads too when it is
-/// [`WIDE`]: true if every piece was whole. A piece stops at an unmapped
-/// page as [`read`] does, and the callers' page-by-page retries go on from
-/// there, as after a [`read`] that was not whole.
-fn read_wide(src: *const u8, dst: *mut u8, len: usize) -> bool {
-    match copy_pool() {
-        Some(pool) if len >= WIDE => pool.run(src as usize, dst as usize, len),
-        _ => read(src, dst, len),
-    }
-}
-
-/// Threads of ours that copy pieces of [`read_wide`] copies
-/// (`VICTORY_COPY_THREADS`, with the caller's: half the logical processors,
-/// 2 to 8; 1 copies on the caller's thread alone).
-struct CopyPool {
-    pieces: std::sync::Mutex<std::collections::VecDeque<Piece>>,
-    ready: std::sync::Condvar,
-}
-
-/// A piece of a copy, and what the copy waits on.
-struct Piece {
-    src: usize,
-    dst: usize,
-    len: usize,
-    copy: std::sync::Arc<Copying>,
-}
-
-/// One [`read_wide`] copy: pieces left, whether all were whole.
-struct Copying {
-    left: std::sync::atomic::AtomicUsize,
-    whole: AtomicBool,
-    lock: std::sync::Mutex<()>,
-    done: std::sync::Condvar,
-}
-
-impl Piece {
-    fn copy(self) {
-        if !read(self.src as *const u8, self.dst as *mut u8, self.len) {
-            self.copy.whole.store(false, Ordering::Relaxed);
-        }
-        if self.copy.left.fetch_sub(1, Ordering::AcqRel) == 1 {
-            let _held = self.copy.lock.lock().unwrap_or_else(|e| e.into_inner());
-            self.copy.done.notify_all();
-        }
-    }
-}
-
-impl CopyPool {
-    /// Copies `len` bytes from `src` to `dst` in pieces, the caller taking
-    /// pieces too, and waits for all of them.
-    fn run(&self, src: usize, dst: usize, len: usize) -> bool {
-        let copy = std::sync::Arc::new(Copying {
-            left: std::sync::atomic::AtomicUsize::new(len.div_ceil(PIECE)),
-            whole: AtomicBool::new(true),
-            lock: std::sync::Mutex::new(()),
-            done: std::sync::Condvar::new(),
-        });
-        {
-            let mut pieces = self.pieces.lock().unwrap_or_else(|e| e.into_inner());
-            let mut at = 0;
-            while at < len {
-                let n = PIECE.min(len - at);
-                pieces.push_back(Piece { src: src + at, dst: dst + at, len: n, copy: copy.clone() });
-                at += n;
-            }
-        }
-        self.ready.notify_all();
-        loop {
-            let piece = self.pieces.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
-            match piece {
-                Some(p) => p.copy(),
-                None => break,
-            }
-        }
-        let mut held = copy.lock.lock().unwrap_or_else(|e| e.into_inner());
-        while copy.left.load(Ordering::Acquire) > 0 {
-            held = copy.done.wait(held).unwrap_or_else(|e| e.into_inner());
-        }
-        copy.whole.load(Ordering::Relaxed)
-    }
-
-    fn work(&self) {
-        loop {
-            let piece = {
-                let mut pieces = self.pieces.lock().unwrap_or_else(|e| e.into_inner());
-                loop {
-                    match pieces.pop_front() {
-                        Some(p) => break p,
-                        None => pieces = self.ready.wait(pieces).unwrap_or_else(|e| e.into_inner()),
-                    }
-                }
-            };
-            piece.copy();
-        }
-    }
-}
-
-/// The copy threads, started on first use; none with one thread.
-fn copy_pool() -> Option<&'static CopyPool> {
-    static POOL: OnceLock<Option<CopyPool>> = OnceLock::new();
-    static STARTED: std::sync::Once = std::sync::Once::new();
-    let threads = || {
-        std::env::var("VICTORY_COPY_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or_else(|| {
-            std::thread::available_parallelism().map_or(4, |n| n.get() / 2).clamp(2, 8)
-        })
-    };
-    let pool = POOL
-        .get_or_init(|| {
-            (threads() > 1).then(|| CopyPool {
-                pieces: std::sync::Mutex::new(std::collections::VecDeque::new()),
-                ready: std::sync::Condvar::new(),
-            })
-        })
-        .as_ref()?;
-    STARTED.call_once(|| {
-        let n = threads();
-        for i in 1..n {
-            let _ = std::thread::Builder::new().name(format!("victory copy {i}")).spawn(move || pool.work());
-        }
-        tracing::info!(threads = n, "title memory copies of 8 MiB and more go in pieces on threads");
-    });
-    Some(pool)
-}
-
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 ///
@@ -2706,7 +2575,7 @@ fn copy_pool() -> Option<&'static CopyPool> {
 /// per frame.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     let write = |at: usize, n: usize| read(src.wrapping_add(at - dst as usize), at as *mut u8, n);
-    if len == 0 || read_wide(src, dst, len) {
+    if len == 0 || write(dst as usize, len) {
         return;
     }
     for_pieces(dst as usize, len, 64 << 10, |at, n| {
@@ -2793,43 +2662,6 @@ mod title_copies {
         assert!(to[BLOCK..2 * BLOCK].iter().all(|&b| b == 0));
         assert!(to[2 * BLOCK..].iter().all(|&b| b == 7));
         release(holes);
-    }
-
-    /// Copies of [`super::WIDE`] and more go in pieces on several threads:
-    /// a large source with an unmapped block in its middle copies whole
-    /// around it, zeros in its place, and copy-back over a destination
-    /// with such a block writes the mapped blocks only.
-    #[test]
-    fn wide_copies_in_pieces_reach_around_unmapped_blocks() {
-        let len = 3 * super::WIDE;
-        let hole = len / 2 + 12_345;
-        let hole = hole - hole % BLOCK;
-        // SAFETY: a fresh reservation; all but one block committed and ours.
-        let base = unsafe {
-            let base = VirtualAlloc(std::ptr::null(), len, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
-            assert!(!base.is_null());
-            for at in (0..len).step_by(BLOCK).filter(|&at| at != hole) {
-                assert!(!VirtualAlloc(base.add(at).cast(), BLOCK, MEM_COMMIT, PAGE_READWRITE).is_null());
-                for i in 0..BLOCK {
-                    *base.add(at + i) = ((at + i) % 251) as u8 + 1;
-                }
-            }
-            base
-        };
-        let mut to = vec![0xeeu8; len];
-        copy_mapped(to.as_mut_ptr(), base, len, false);
-        for (at, &b) in to.iter().enumerate() {
-            let want = if (hole..hole + BLOCK).contains(&at) { 0 } else { (at % 251) as u8 + 1 };
-            assert_eq!(b, want, "byte {at}");
-        }
-        let from: Vec<u8> = (0..len).map(|i| (i % 241) as u8).collect();
-        write_mapped(base, from.as_ptr(), len);
-        // SAFETY: the committed blocks of the reservation.
-        let back = |at: usize| unsafe { *base.add(at) };
-        for at in (0..len).step_by(997).filter(|at| !(hole..hole + BLOCK).contains(at)) {
-            assert_eq!(back(at), from[at], "byte {at}");
-        }
-        release(base);
     }
 
     #[test]
