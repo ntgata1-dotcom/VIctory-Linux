@@ -2,7 +2,7 @@
 //! tests, drawing a full-screen triangle and reading the target back.
 
 use std::ffi::CString;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock};
 
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -30,6 +30,7 @@ pub fn under_wine() -> bool {
 
 pub struct Host {
     pub device: ID3D12Device,
+    queue: OnceLock<Result<ID3D12CommandQueue, String>>,
     warp: bool,
 }
 
@@ -78,9 +79,13 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
-/// A D3D12 device kept alive for the process so concurrent callers do not
-/// race creating and tearing down the same singleton adapter device.
-struct SharedDevice(ID3D12Device);
+/// One device and command queue per adapter kind, kept alive for the process.
+/// Every vkd3d-proton queue starts a fence thread; thousands of queues make
+/// Wine's process teardown exceed wineserver's 0.5 s kill timeout.
+struct SharedDevice {
+    device: ID3D12Device,
+    queue: ID3D12CommandQueue,
+}
 
 // SAFETY: `ID3D12Device` is free-threaded; cloning increments its COM
 // reference count.
@@ -119,6 +124,24 @@ fn create_device(warp: bool) -> Result<ID3D12Device, String> {
         }
         Ok(device)
     }
+}
+
+fn create_queue(device: &ID3D12Device) -> Result<ID3D12CommandQueue, String> {
+    // SAFETY: a direct queue with a valid out pointer.
+    unsafe {
+        device
+            .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ..Default::default()
+            })
+            .map_err(err)
+    }
+}
+
+fn create_shared(warp: bool) -> Result<SharedDevice, String> {
+    let device = create_device(warp)?;
+    let queue = create_queue(&device)?;
+    Ok(SharedDevice { device, queue })
 }
 
 /// Whether `device` runs on a software adapter (WARP); `true` when that
@@ -171,8 +194,21 @@ fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapt
 /// Serializes WARP (`d3d10warp.dll`) operations across threads: concurrent
 /// WARP pipeline compiles / dispatches crash with `0xC0000005` on Windows 11.
 static WARP_LOCK: Mutex<()> = Mutex::new(());
+static HARDWARE_DEVICE: LazyLock<Result<SharedDevice, String>> =
+    LazyLock::new(|| create_shared(false));
+static WARP_DEVICE: LazyLock<Result<SharedDevice, String>> = LazyLock::new(|| {
+    let _guard = WARP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    create_shared(true)
+});
 
 impl Host {
+    fn queue(&self) -> Result<&ID3D12CommandQueue, String> {
+        self.queue
+            .get_or_init(|| create_queue(&self.device))
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
     fn lock_warp(&self) -> Option<MutexGuard<'static, ()>> {
         self.warp
             .then(|| WARP_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
@@ -183,31 +219,34 @@ impl Host {
     /// refused, so hardware-only checks never run on WARP.
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
-        if warp {
-            static WARP: OnceLock<Result<SharedDevice, String>> = OnceLock::new();
-            let shared = WARP.get_or_init(|| {
-                let _guard = WARP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-                create_device(true).map(SharedDevice)
-            });
-            return shared
-                .as_ref()
-                .map(|d| Host {
-                    device: d.0.clone(),
-                    warp: true,
-                })
-                .map_err(Clone::clone);
-        }
-        Ok(Host {
-            device: create_device(false)?,
-            warp: false,
-        })
+        let shared = if warp {
+            &*WARP_DEVICE
+        } else {
+            &*HARDWARE_DEVICE
+        };
+        shared
+            .as_ref()
+            .map(|d| {
+                let queue = OnceLock::new();
+                queue.set(Ok(d.queue.clone())).expect("fresh queue cell");
+                Host {
+                    device: d.device.clone(),
+                    queue,
+                    warp,
+                }
+            })
+            .map_err(Clone::clone)
     }
 
     /// A host on a device made elsewhere (the GPU crate's). Its work is
     /// serialised as WARP's is when the device runs on a software adapter.
     pub fn from_device(device: ID3D12Device) -> Self {
         let warp = on_software_adapter(&device);
-        Host { device, warp }
+        Host {
+            device,
+            queue: OnceLock::new(),
+            warp,
+        }
     }
 
     /// The root signature translated shaders expect: user data per stage
@@ -631,12 +670,7 @@ impl Host {
         // SAFETY: D3D12 calls with descriptions that outlive them; the
         // resources stay alive until the fence says the GPU is done.
         unsafe {
-            let queue: ID3D12CommandQueue = dev
-                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    ..Default::default()
-                })
-                .map_err(err)?;
+            let queue = self.queue()?;
             let alloc: ID3D12CommandAllocator = dev
                 .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
                 .map_err(err)?;
@@ -981,12 +1015,7 @@ impl Host {
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
         // are kept alive until the fence says the GPU is done.
         unsafe {
-            let queue: ID3D12CommandQueue = dev
-                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    ..Default::default()
-                })
-                .map_err(err)?;
+            let queue = self.queue()?;
             let alloc: ID3D12CommandAllocator = dev
                 .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
                 .map_err(err)?;
@@ -1421,12 +1450,7 @@ impl Host {
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
         // stay alive until the fence says the GPU is done.
         unsafe {
-            let queue: ID3D12CommandQueue = dev
-                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    ..Default::default()
-                })
-                .map_err(err)?;
+            let queue = self.queue()?;
             let alloc: ID3D12CommandAllocator = dev
                 .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
                 .map_err(err)?;
