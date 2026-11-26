@@ -133,7 +133,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
                 }
             }
             account().submissions += 1;
-            let _ = ask(asked, Why::Submission);
+            ask(asked, Why::Submission);
             return;
         }
         let mut held = held();
@@ -185,14 +185,8 @@ fn held() -> std::sync::MutexGuard<'static, Holding> {
 pub(crate) fn pump_held(why: Why) {
     #[cfg(windows)]
     if async_queue() {
-        // Before a frame is shown, what was asked before it has run as far
-        // as it may (as without the worker); other callers only wake it.
-        match why {
-            Why::Present => drain(),
-            _ => {
-                let _ = ask(Vec::new(), why);
-            }
-        }
+        // The worker runs it (PresentX goes to it as an item, see `present`).
+        ask(Vec::new(), why);
         return;
     }
     #[cfg(windows)]
@@ -206,7 +200,7 @@ pub(crate) fn pump_held(why: Why) {
 pub(crate) fn pump_held_if_free(why: Why) {
     #[cfg(windows)]
     if async_queue() {
-        let _ = ask(Vec::new(), why);
+        ask(Vec::new(), why);
         return;
     }
     #[cfg(windows)]
@@ -243,18 +237,18 @@ enum Asked {
     Push(usize, Item<std::sync::Arc<crate::host::HostList>>),
     /// A Signal (the fence kept alive until it is set).
     Signal(usize, usize, u64),
+    /// PresentX of a frame: shown once what was asked before it has run as
+    /// far as it may.
+    Present(u64, Vec<usize>),
 }
 
 /// The worker's inbox: what was asked, in order, whether the worker is
-/// running a pass, the first reason it was woken for, and how many calls
-/// asked of it and how many its finished passes took in.
+/// running a pass, and the first reason it was woken for.
 #[cfg(windows)]
 struct Inbox {
     asked: std::collections::VecDeque<Asked>,
     busy: bool,
     woken: Option<Why>,
-    calls: u64,
-    done: u64,
 }
 
 #[cfg(windows)]
@@ -262,25 +256,19 @@ static INBOX: std::sync::Mutex<Inbox> = std::sync::Mutex::new(Inbox {
     asked: std::collections::VecDeque::new(),
     busy: false,
     woken: None,
-    calls: 0,
-    done: 0,
 });
 /// The worker waits here for something asked.
 #[cfg(windows)]
 static WAKE: std::sync::Condvar = std::sync::Condvar::new();
-/// Callers of [`drain`] wait here for the worker to be done.
-#[cfg(windows)]
-static IDLE: std::sync::Condvar = std::sync::Condvar::new();
 
 #[cfg(windows)]
 fn inbox() -> std::sync::MutexGuard<'static, Inbox> {
     INBOX.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Puts `asked` in the inbox and wakes the worker (started on first use):
-/// the call's number, done once a pass that took it in has finished.
+/// Puts `asked` in the inbox and wakes the worker (started on first use).
 #[cfg(windows)]
-fn ask(asked: Vec<Asked>, why: Why) -> u64 {
+fn ask(asked: Vec<Asked>, why: Why) {
     static WORKER: std::sync::Once = std::sync::Once::new();
     WORKER.call_once(|| {
         std::thread::Builder::new()
@@ -291,9 +279,7 @@ fn ask(asked: Vec<Asked>, why: Why) -> u64 {
     let mut inbox = inbox();
     inbox.asked.extend(asked);
     inbox.woken.get_or_insert(why);
-    inbox.calls += 1;
     WAKE.notify_one();
-    inbox.calls
 }
 
 /// A queue's Signal: at once if nothing that queue was asked for is
@@ -304,7 +290,8 @@ fn signal_async(queue: usize, fence: This, value: u64) {
         let inbox = inbox();
         // The worker takes `HELD` only while busy, which it marks under the
         // inbox's lock: held here, it cannot start.
-        let idle = !inbox.busy && !inbox.asked.iter().any(|a| matches!(a, Asked::Push(q, _) | Asked::Signal(q, ..) if *q == queue));
+        let idle = !inbox.busy
+            && !inbox.asked.iter().any(|a| matches!(a, Asked::Push(q, _) | Asked::Signal(q, ..) if *q == queue));
         if idle
             && let Ok(held) = HELD.try_lock()
             && !held.holds_work(queue)
@@ -313,23 +300,12 @@ fn signal_async(queue: usize, fence: This, value: u64) {
             drop(held);
             drop(inbox);
             // Another queue may wait for this fence.
-            let _ = ask(Vec::new(), Why::Signal);
+            ask(Vec::new(), Why::Signal);
             return;
         }
     }
     crate::fence::keep(fence);
-    let _ = ask(vec![Asked::Signal(queue, fence as usize, value)], Why::Signal);
-}
-
-/// Waits until the worker has run what was asked before this call as far
-/// as it may (work blocked on a wait stays held, as without the worker).
-#[cfg(windows)]
-fn drain() {
-    let call = ask(Vec::new(), Why::Present);
-    let mut inbox = inbox();
-    while inbox.done < call {
-        inbox = IDLE.wait(inbox).unwrap_or_else(|e| e.into_inner());
-    }
+    ask(vec![Asked::Signal(queue, fence as usize, value)], Why::Signal);
 }
 
 /// The worker: moves what was asked into the held queues, in order (a
@@ -338,19 +314,23 @@ fn drain() {
 #[cfg(windows)]
 fn work() {
     loop {
-        let (asked, why, calls) = {
+        let (asked, why) = {
             let mut inbox = inbox();
             while inbox.asked.is_empty() && inbox.woken.is_none() {
                 inbox = WAKE.wait(inbox).unwrap_or_else(|e| e.into_inner());
             }
             inbox.busy = true;
             let why = inbox.woken.take().unwrap_or(Why::Submission);
-            (std::mem::take(&mut inbox.asked), why, inbox.calls)
+            (std::mem::take(&mut inbox.asked), why)
         };
         {
             let mut held = held();
             for a in asked {
                 match a {
+                    Asked::Present(frame, planes) => {
+                        pump(&mut held, why);
+                        show(frame, &planes);
+                    }
                     Asked::Push(queue, item) => held.push(queue, item),
                     Asked::Signal(queue, fence, value) => {
                         if held.holds_work(queue) {
@@ -364,10 +344,7 @@ fn work() {
             }
             pump(&mut held, why);
         }
-        let mut inbox = inbox();
-        inbox.busy = false;
-        inbox.done = calls;
-        IDLE.notify_all();
+        inbox().busy = false;
     }
 }
 
@@ -598,7 +575,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     #[cfg(windows)]
     if crate::host::host().is_some() && crate::fence::value(fence) < value {
         if async_queue() {
-            let _ = ask(vec![Asked::Push(this as usize, Item::FenceWait(fence as usize, value))], Why::Wait);
+            ask(vec![Asked::Push(this as usize, Item::FenceWait(fence as usize, value))], Why::Wait);
         } else {
             let mut held = held();
             held.push(this as usize, Item::FenceWait(fence as usize, value));
@@ -681,9 +658,32 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
-    // What may run before the frame is shown does.
+    // The first resource of each plane, taken now: the worker may show the
+    // frame after this call returns.
+    #[cfg(windows)]
+    let shown: Vec<usize> = if planes > 0 && !plane_parameters.is_null() {
+        // SAFETY: the title passes the plane descriptions.
+        let slice = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
+        slice
+            .iter()
+            .filter(|p| p.count != 0 && !p.resources.is_null())
+            // SAFETY: the plane lists `count` resources.
+            .map(|p| unsafe { *p.resources } as usize)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    #[cfg(windows)]
+    let worker = async_queue();
+    // What may run before the frame is shown does (with the worker, it
+    // shows the frame once that has run: see `work`).
     // shortcut: PresentX does not wait behind work the queue still holds (it
     // shows the frame as far as it ran); the frame line names such work.
+    #[cfg(windows)]
+    if !worker {
+        pump_held(Why::Present);
+    }
+    #[cfg(not(windows))]
     pump_held(Why::Present);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     #[cfg(windows)]
@@ -718,32 +718,39 @@ extern "system" fn present(
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
         }
     }
-    #[cfg(all(windows, feature = "diagnostics"))]
+    #[cfg(windows)]
+    if worker {
+        ask(vec![Asked::Present(frame, shown)], Why::Present);
+    } else {
+        show(frame, &shown);
+    }
+    #[cfg(not(windows))]
+    let _ = (planes, plane_parameters);
+    S_OK
+}
+
+/// Shows frame `frame`: the first resource of each of its planes, in our
+/// window (on the title's thread, or the worker's once what was asked
+/// before it has run).
+#[cfg(windows)]
+fn show(frame: u64, planes: &[usize]) {
+    #[cfg(feature = "diagnostics")]
     {
         crate::capture::presented(frame);
         if crate::capture::listed(frame) || crate::capture::has_targets() {
             crate::capture::dump_targets(frame);
         }
     }
-    #[cfg(windows)]
-    if planes > 0
-        && !plane_parameters.is_null()
+    if !planes.is_empty()
         && let Some(host) = crate::host::host()
     {
         use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
         use windows::core::Interface;
 
         const COPY_SOURCE: u32 = 0x800;
-        // SAFETY: the title passes the plane descriptions.
-        let slice = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
-        let mut resources: Vec<(This, ID3D12Resource, u32, bool)> =
-            Vec::with_capacity(slice.len());
-        for plane in slice {
-            if plane.count == 0 || plane.resources.is_null() {
-                continue;
-            }
-            // SAFETY: the plane lists `count` resources.
-            let resource = unsafe { *plane.resources };
+        let mut resources: Vec<(This, ID3D12Resource, u32, bool)> = Vec::with_capacity(planes.len());
+        for &resource in planes {
+            let resource = resource as This;
             if let Some(texture) = crate::resource::host_resource(resource) {
                 // Distinct title resources may refer to one host texture.
                 // Keep its original state for every plane and restore it once.
@@ -771,12 +778,9 @@ extern "system" fn present(
             #[cfg(feature = "diagnostics")]
             blinks(frame, resources[0].0, resources[0].2, shown);
             #[cfg(not(feature = "diagnostics"))]
-            let _ = shown;
+            let _ = (frame, shown);
         }
     }
-    #[cfg(not(windows))]
-    let _ = (planes, plane_parameters);
-    S_OK
 }
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
