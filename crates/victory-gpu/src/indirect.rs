@@ -4,7 +4,15 @@
 //! billion vertices or a dispatch past the host's limits runs until the
 //! host resets the display driver. So every record is clamped on the GPU,
 //! just before its execution, by a compute shader of ours (HLSL compiled by
-//! the system's compiler; a 5.1 shader with its root signature inside).
+//! the system's compiler, a 5.1 shader; its root signature is made beside
+//! it).
+//!
+//! The source keeps to what Wine's compiler takes as well as Microsoft's:
+//! Wine's has no methods on byte address buffers (`Load`, `Store`) and
+//! ignores a `RootSignature` attribute, and without the clamp every indirect
+//! execution is dropped. So the buffers are structured buffers of `uint`,
+//! which a root descriptor can be, and records are indexed in words: the
+//! caller already refuses addresses and strides that are not multiples of 4.
 //!
 //! Each list also has a budget (2^27 vertex instances or threads, groups
 //! counted as 64 threads, mesh groups as 128): records past it run empty,
@@ -24,48 +32,51 @@ use windows::core::s;
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), UAV(u1), UAV(u0)"
 cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
 // The title's records, read only; the clamped ones go to the list's own.
-ByteAddressBuffer args : register(t0);
-RWByteAddressBuffer dest : register(u0);
+StructuredBuffer<uint> args : register(t0);
+RWStructuredBuffer<uint> dest : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
-RWByteAddressBuffer budget : register(u1);
+RWStructuredBuffer<uint> budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
-// Clamps the record at `at` into `dest`; its cost.
+// Clamps the record at word `at` into `dest`; its cost.
 uint clamped(uint at) {
     uint cost;
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
-        uint count = min(args.Load(at), 1u << 24);
-        uint instances = min(args.Load(at + 4), (1u << 26) / max(count, 1u));
+        uint count = min(args[at], 1u << 24);
+        uint instances = min(args[at + 1], (1u << 26) / max(count, 1u));
         cost = count * instances;
-        dest.Store2(at, uint2(count, instances));
+        dest[at] = count;
+        dest[at + 1] = instances;
         // The rest of the record as it is: first vertex and instance (4 words
         // in all), or first index, base vertex and first instance (5).
+        dest[at + 2] = args[at + 2];
+        dest[at + 3] = args[at + 3];
         if (kind == 1) {
-            dest.Store3(at + 8, args.Load3(at + 8));
-        } else {
-            dest.Store2(at + 8, args.Load2(at + 8));
+            dest[at + 4] = args[at + 4];
         }
-    } else if (kind == 2) {
-        uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
+        return cost;
+    }
+    uint3 g = uint3(args[at], args[at + 1], args[at + 2]);
+    if (kind == 2) {
+        g = min(g, uint3(65535, 65535, 65535));
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
         }
         cost = g.x * g.y * g.z * 64;
-        dest.Store3(at, g);
     } else {
         // Mesh dispatches: the console's are one-dimensional.
-        uint3 g = args.Load3(at);
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128;
-        dest.Store3(at, g);
     }
+    dest[at] = g.x;
+    dest[at + 1] = g.y;
+    dest[at + 2] = g.z;
     return cost;
 }
 // A record past the budget (no cost reaches it).
@@ -75,16 +86,15 @@ groupshared uint costs[64];
 // record, then the first lane charges the tile's records in order. No
 // other group shares the budget: a shared add wraps once enough records
 // are rejected, and a compare-exchange retries more the more records fit.
-[RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint lane : SV_GroupIndex) {
     uint left = 0;
     if (lane == 0) {
-        left = BUDGET - min(budget.Load(0), BUDGET);
+        left = BUDGET - min(budget[0], BUDGET);
     }
     for (uint tile = 0; tile < records / 64 + min(records % 64, 1u); tile++) {
         uint record = tile * 64 + lane;
-        uint at = record * stride;
+        uint at = record * (stride / 4);
         uint cost = 0;
         if (record < records) {
             cost = clamped(at);
@@ -106,11 +116,11 @@ void main(uint lane : SV_GroupIndex) {
         GroupMemoryBarrierWithGroupSync();
         if (costs[lane] == PAST) {
             // Draws keep their layout with no vertices; groups become zero.
-            dest.Store(at, 0);
+            dest[at] = 0;
         }
     }
     if (lane == 0) {
-        budget.Store(0, BUDGET - left);
+        budget[0] = BUDGET - left;
     }
 }
 "#;
@@ -136,6 +146,62 @@ fn clamp() -> Option<&'static Clamp> {
             }
         })
         .as_ref()
+}
+
+/// The clamp's root signature, in the order [`bound`] sets it: the record
+/// constants (b0), the title's records (t0), the budget (u1) and the list's
+/// arguments (u0).
+fn root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSignature> {
+    let view = |kind, register| D3D12_ROOT_PARAMETER1 {
+        ParameterType: kind,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                ShaderRegister: register,
+                RegisterSpace: 0,
+                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    };
+    let constants = D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 4 };
+    let params = [
+        D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 { Constants: constants },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        },
+        view(D3D12_ROOT_PARAMETER_TYPE_SRV, 0),
+        view(D3D12_ROOT_PARAMETER_TYPE_UAV, 1),
+        view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0),
+    ];
+    let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+        Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+        Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+            Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                NumParameters: params.len() as u32,
+                pParameters: params.as_ptr(),
+                ..Default::default()
+            },
+        },
+    };
+    let mut blob: Option<ID3DBlob> = None;
+    let mut errors: Option<ID3DBlob> = None;
+    // SAFETY: the description points at a live array; out pointers ours;
+    // the blobs' own bytes.
+    unsafe {
+        let bytes = |b: &ID3DBlob| {
+            std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize())
+        };
+        if let Err(e) = D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut errors)) {
+            if let Some(errors) = errors {
+                let text = String::from_utf8_lossy(bytes(&errors));
+                tracing::warn!("argument clamp root signature: {text}");
+            }
+            return Err(e);
+        }
+        let blob = blob.ok_or_else(windows::core::Error::empty)?;
+        device.CreateRootSignature(0, bytes(&blob))
+    }
 }
 
 fn make() -> windows::core::Result<Clamp> {
@@ -169,10 +235,10 @@ fn make() -> windows::core::Result<Clamp> {
         return Err(e);
     }
     let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
+    let root = root_signature(device)?;
+    // SAFETY: the blob's own bytes.
     unsafe {
         let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
@@ -271,11 +337,11 @@ mod tests {
     }
 
     /// Clamps `records` records of `kind`, filled by repeating `words`,
-    /// `calls` times in one list: each record's first word in the list's
-    /// argument buffer after (zero when it runs empty). The title's copy,
+    /// `calls` times in one list: each record's words in the list's argument
+    /// buffer after (the first zero when it runs empty). The title's copy,
     /// one record more included, stays as written. `None` without a host
     /// GPU.
-    fn clamped(kind: u32, words: &[u32], records: u32, calls: u32) -> Option<Vec<u32>> {
+    fn clamped(kind: u32, words: &[u32], records: u32, calls: u32) -> Option<Vec<Vec<u32>>> {
         let host = super::host()?;
         // Words in a record of `kind`.
         let per = match kind {
@@ -308,9 +374,22 @@ mod tests {
             }
             let mut out_data = std::ptr::null_mut();
             out?.Map(0, None, Some(&mut out_data)).unwrap();
-            let first = |i: usize| out_data.cast::<u32>().add(i * per).read_volatile();
-            Some((0..records as usize).map(first).collect())
+            let word = |at: usize| out_data.cast::<u32>().add(at).read_volatile();
+            Some((0..records as usize).map(|i| (i * per..(i + 1) * per).map(word).collect()).collect())
         }
+    }
+
+    /// Every word of a record reaches the list's buffer, the second record's
+    /// too: the clamped counts and, for draws, the rest as it was.
+    #[test]
+    fn records_arrive_whole() {
+        let Some(draws) = clamped(0, &[1 << 25, 2, 7, 9], 2, 1) else {
+            return; // no host GPU here
+        };
+        assert_eq!(draws, [[1 << 24, 2, 7, 9]; 2]);
+        assert_eq!(clamped(1, &[5, 3, 7, 9, 11], 2, 1).unwrap(), [[5, 3, 7, 9, 11]; 2]);
+        assert_eq!(clamped(2, &[70_000, 2, 1], 2, 1).unwrap(), [[65_535, 2, 1]; 2]);
+        assert_eq!(clamped(10, &[70_000, 2, 3], 2, 1).unwrap(), [[65_535, 1, 1]; 2]);
     }
 
     /// Rejected records do not wrap the budget: of 128 garbage draws (2^26
@@ -321,9 +400,9 @@ mod tests {
         let Some(draws) = clamped(0, &[u32::MAX], 128, 1) else {
             return; // no host GPU here
         };
-        assert_eq!(draws.iter().filter(|&&count| count != 0).count(), 2);
+        assert_eq!(draws.iter().filter(|r| r[0] != 0).count(), 2);
         let meshes = clamped(10, &[u32::MAX], 600, 1).unwrap();
-        assert_eq!(meshes.iter().filter(|&&groups| groups != 0).count(), 16);
+        assert_eq!(meshes.iter().filter(|r| r[0] != 0).count(), 16);
     }
 
     /// The budget goes to the first records, in order: of 200 draws of
@@ -334,10 +413,10 @@ mod tests {
         let Some(draws) = clamped(0, &[3 << 18, 1, 0, 0], 200, 1) else {
             return; // no host GPU here
         };
-        assert!(draws[..170].iter().all(|&count| count != 0));
-        assert!(draws[170..].iter().all(|&count| count == 0));
+        assert!(draws[..170].iter().all(|r| r[0] != 0));
+        assert!(draws[170..].iter().all(|r| r[0] == 0));
         let small = clamped(0, &[1], 1 << 16, 1).unwrap();
-        assert!(small.iter().all(|&count| count == 1));
+        assert!(small.iter().all(|r| r[0] == 1));
     }
 
     /// A record that does not fit ends the budget: after two draws of
@@ -350,7 +429,7 @@ mod tests {
         let Some(draws) = clamped(0, &words, 8, 1) else {
             return; // no host GPU here
         };
-        let ran: Vec<bool> = draws.iter().map(|&count| count != 0).collect();
+        let ran: Vec<bool> = draws.iter().map(|r| r[0] != 0).collect();
         assert_eq!(ran, [true, true, false, false, false, false, false, false]);
     }
 
@@ -415,6 +494,6 @@ mod tests {
         let Some(twice) = clamped(1, &[u32::MAX], 64, 2) else {
             return; // no host GPU here
         };
-        assert!(twice.iter().all(|&count| count == 0));
+        assert!(twice.iter().all(|r| r[0] == 0));
     }
 }
