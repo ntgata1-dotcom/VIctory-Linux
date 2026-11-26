@@ -601,6 +601,24 @@ impl Module {
             .count()
     }
 
+    /// Test builds: the headers each written block branches back to, as
+    /// written (through folded blocks).
+    #[cfg(test)]
+    pub fn back_edges(&self) -> Vec<Vec<usize>> {
+        let plan = self.plan();
+        let back = |b: usize| {
+            let mut back: Vec<usize> = successors(self.term(b))
+                .iter()
+                .map(|&s| plan.to(s))
+                .filter(|&t| plan.pos[t] <= plan.pos[b])
+                .collect();
+            back.sort_unstable();
+            back.dedup();
+            back
+        };
+        plan.layout.iter().map(|&b| back(b)).collect()
+    }
+
     /// The globals and functions [`Module::write`] declares, each kept
     /// one's new index and their number: functions declared and not called,
     /// and constant globals nothing reads, are left out (the validator
@@ -655,6 +673,14 @@ impl Module {
     /// (lowering splits them so that loops have dedicated exits and
     /// preheaders, as DXC emits them), or its predecessor would reach the
     /// target twice (the target's phis have one entry per predecessor).
+    ///
+    /// No written block branches back to two headers: one that does makes
+    /// dxil-spirv recurse until its stack runs out when it flattens subgroup
+    /// shuffles (HansKristian-Work/dxil-spirv#380; the dxil-spirv GE-Proton's
+    /// vkd3d-proton pins has it). An empty latch folded into an inner loop's
+    /// latch (the outer loop's, entered from there) is a block of its own
+    /// again, as DXC leaves an outer latch: the block keeps its own back
+    /// edge, else the one to its innermost header.
     fn plan(&self) -> Plan {
         let live = self.live();
         let succs = |b: usize| successors(self.term(b));
@@ -706,6 +732,25 @@ impl Module {
                 let critical = succs(from).len() > 1 && preds[at].len() > 1 && pos[h] > pos[b];
                 if critical || succs(from).iter().filter(|&&s| plan.to(s) == at).count() != 1 {
                     plan.fold[b] = None;
+                }
+            }
+        }
+        for &b in &post {
+            let succ = succs(b);
+            let back = |plan: &Plan, s: usize| Some(plan.to(s)).filter(|&t| pos[t] <= pos[b]);
+            let mut headers: Vec<usize> = succ.iter().filter_map(|&s| back(&plan, s)).collect();
+            headers.dedup();
+            if plan.fold[b].is_some() || headers.len() < 2 {
+                continue;
+            }
+            let keep = succ
+                .iter()
+                .copied()
+                .find(|&s| plan.fold[s].is_none() && pos[s] <= pos[b])
+                .or(headers.iter().copied().max_by_key(|&t| pos[t]));
+            for &s in succ.iter() {
+                if back(&plan, s).is_some_and(|t| Some(t) != keep) {
+                    plan.fold[s] = None;
                 }
             }
         }
@@ -1629,6 +1674,51 @@ mod tests {
         assert!(successors(Some(Term::Ret)).is_empty());
         assert_eq!(&*successors(Some(Term::Br(7))), &[7]);
         assert_eq!(&*successors(Some(Term::CondBr(V::Const(0), 3, 5))), &[3, 5]);
+    }
+
+    /// An inner loop's latch that leaves for the outer loop's empty latch
+    /// keeps that latch a block of its own: folded, the inner latch would
+    /// branch back to both headers (dxil-spirv#380). A loop's empty latch
+    /// after the nest still folds.
+    #[test]
+    fn an_inner_latch_keeps_the_outer_latch() {
+        let mut m = Module::default();
+        let void = m.void();
+        let main_ty = m.func_ty(void, vec![]);
+        m.function("main", main_ty, None, true);
+        let [
+            entry,
+            outer,
+            pre,
+            inner,
+            latch,
+            outer_latch,
+            exit,
+            head,
+            tail_latch,
+            end,
+        ] = std::array::from_fn(|_| m.new_block());
+        // Not a constant: `Module::term` takes a constant branch's one edge.
+        let (a, b) = (m.i32(1), m.i32(2));
+        let c = m.cmp(entry, pred::EQ, a, b);
+        m.terminate(entry, Term::Br(outer));
+        m.terminate(outer, Term::CondBr(c, pre, exit));
+        m.terminate(pre, Term::Br(inner));
+        m.terminate(inner, Term::Br(latch));
+        m.terminate(latch, Term::CondBr(c, inner, outer_latch));
+        m.terminate(outer_latch, Term::Br(outer));
+        m.terminate(exit, Term::Br(head));
+        m.terminate(head, Term::CondBr(c, tail_latch, end));
+        m.terminate(tail_latch, Term::Br(head));
+        m.terminate(end, Term::Ret);
+
+        let plan = m.plan();
+        assert_eq!(plan.fold[outer_latch], None);
+        assert_eq!(plan.fold[tail_latch], Some((head, head)));
+        let back = m.back_edges();
+        assert!(back.iter().all(|b| b.len() <= 1), "{back:?}");
+        // The inner loop's, the outer latch's and the last loop's.
+        assert_eq!(back.iter().filter(|b| !b.is_empty()).count(), 3);
     }
 
     /// The written bytes are pinned (anew when the writer began to drop
