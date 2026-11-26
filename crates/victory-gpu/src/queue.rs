@@ -454,7 +454,13 @@ fn account_frame(frame: u64) {
     let (cuts, early) = crate::list::take_cuts();
     let (fence_waits, fence_waited) = crate::fence::take_waited();
     let a = std::mem::take(&mut *account());
-    let blocked = held().blocked(&read_value);
+    // A frame line only: with the worker, whose submissions hold `HELD`
+    // throughout, PresentX would wait for one to read it.
+    let blocked = if async_queue() {
+        HELD.try_lock().map(|held| held.blocked(&read_value)).unwrap_or_default()
+    } else {
+        held().blocked(&read_value)
+    };
     if a.released.is_empty() && blocked.is_empty() && a.forced == 0 && a.unknown == 0 && a.mappings == 0 {
         return;
     }
