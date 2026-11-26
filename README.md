@@ -2,6 +2,22 @@
 
 [VIctory](https://github.com/Marvisak/VIctory) with the fixes it needs on Linux merged in, and scripts to build and run it there under Wine: see **[LINUX.md](LINUX.md)**. The rest of this file is upstream's README, unchanged.
 
+## Results
+
+Measured on one machine (Ryzen 9 7900X, RX 9070 XT, RADV / Mesa 26.3, Wine 11.22, vkd3d-proton from GE-Proton11-14), the first mission's opening:
+
+| | Frame time | |
+|---|---|---|
+| Upstream `main` under Wine, as is | – | ended about 20 s after start, on a shader-converter abort ([#2723](https://github.com/Marvisak/VIctory/pull/2723), merged here, is for it); without [#2913](https://github.com/Marvisak/VIctory/pull/2913) the world draws black |
+| This repository with Wine's own wineserver, shaders built during play | 1,880 ms | the world draws lit |
+| This repository, set up as [LINUX.md](LINUX.md) describes | **~425 ms** median, about 200 ms at best | the opening plays through to player control |
+
+- A 30-minute run ended on its time limit, with no crash, no GPU fault and nothing in the kernel log.
+- What made the difference, each step measured: a faster wineserver ([`linux/build-wineserver.sh`](linux/build-wineserver.sh)), shaders and pipelines built ahead ([`linux/warm-cache.sh`](linux/warm-cache.sh)), and not waiting every frame for a pipeline that never finishes ([#3071](https://github.com/Marvisak/VIctory/pull/3071)). Details and the measurements in [LINUX.md](LINUX.md#speed).
+- [`linux/summary.sh`](linux/summary.sh) turns a run's log into the same numbers, so runs on other machines can be compared.
+
+You need your own copy of the game; nothing from it is in this repository.
+
 ---
 
 # VIctory
